@@ -16,3 +16,8 @@
 
 - After the Carbon pilot and before any main-run outcome was opened, Zack approved removing one surrounding Markdown code fence when the whole completion is a single fenced block. This applies to all models and conditions for the primary analysis. The original strict parser coverage is reported beside amended coverage. The original completions, schemas, prompts, stimuli, caps and sample are preserved.
 - The amended gate re-parses the stored Carbon pilot offline. Carbon may run on all 300 clips only if amended coverage reaches 23/24 or better in every pilot condition and the prior cost and verification gates pass. The approval covers operational coverage reporting and preserves the separate approval requirement for outcome analysis.
+
+## Gate 3 analysis additions
+
+- Zack approved analysis of the three completed main runs. The amended parser is primary and every estimable metric is also calculated with the strict parser. The parser comparison uses the valid subset under each rule. The stored responses and reference labels are retained.
+- **Exploratory format checks.** Zack requested a descriptive table of Carbon label counts grouped by single-fence detection, and a count and two verbatim examples of OpenAI P3 prose responses. The Carbon table uses amended outputs and keeps P3 argmax ties explicit. The OpenAI examples illustrate format failures. A response that says it could not hear the clip provides no independent evidence about audio delivery.

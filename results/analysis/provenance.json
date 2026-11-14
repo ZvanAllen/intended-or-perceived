@@ -1,0 +1,58 @@
+{
+  "manifest_sha256": "0742e730a95a51cefc97b942358a078e5712cb2415a406e7bf733e6ffe5d741e",
+  "prompt_files": {
+    "P1-R1": {
+      "family": "P1",
+      "file": "P1.txt",
+      "sha256": "87aa3b697b275ae5b28e0bbd7a241fd2ab714eb1788fede6f90e63997ab79e47"
+    },
+    "P1-R2": {
+      "family": "P1",
+      "file": "P1.txt",
+      "sha256": "87aa3b697b275ae5b28e0bbd7a241fd2ab714eb1788fede6f90e63997ab79e47"
+    },
+    "P1-R3": {
+      "family": "P1",
+      "file": "P1.txt",
+      "sha256": "87aa3b697b275ae5b28e0bbd7a241fd2ab714eb1788fede6f90e63997ab79e47"
+    },
+    "P2": {
+      "family": "P2",
+      "file": "P2.txt",
+      "sha256": "3a7c90e00813f6c77f70a3842683d9625f9f0cb5686d546b29902998f97cfd3f"
+    },
+    "P3": {
+      "family": "P3",
+      "file": "P3-v2.txt",
+      "sha256": "1ef36e9cbef7106066a95698758f33c2e1fd6ed84e8dd3dfa7b7cb515dc8b994"
+    }
+  },
+  "models": [
+    "openai/gpt-audio-1.5",
+    "google/gemini-3.5-flash-lite",
+    "google/gemini-4-carbon"
+  ],
+  "served_models": {
+    "openai/gpt-audio-1.5": [
+      "gpt-audio-1.5"
+    ],
+    "google/gemini-3.5-flash-lite": [
+      "gemini-3.5-flash-lite"
+    ],
+    "google/gemini-4-carbon": [
+      "gemini-4-carbon"
+    ]
+  },
+  "main_run_utc_dates": [
+    "2026-11-14"
+  ],
+  "raw_transcript_sha256": {
+    "main": "0957992fd3073baa0ea6f26796b02254f2e0358466654cf7dd32e8f3be2b940c",
+    "third-main-gemini-4-carbon": "b6fb36c2634902719efab02b4580161f5e0b6fc5ecab2e3d538aa8ef56193e8d"
+  },
+  "bootstrap": {
+    "replicates": 2000,
+    "seed": 20261112,
+    "cluster": "actor"
+  }
+}

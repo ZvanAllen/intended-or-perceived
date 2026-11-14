@@ -13,6 +13,7 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest==8.3.5", "pytest-asyncio==0.26.0", "ruff==0.17.2"]
+analysis = ["matplotlib==3.10.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
