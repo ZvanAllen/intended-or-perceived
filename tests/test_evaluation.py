@@ -10,6 +10,7 @@ import pytest
 from intended_or_perceived import evaluation
 from intended_or_perceived.budget import (
     GEMINI,
+    GEMINI_CARBON,
     GOOGLE_HOST,
     OPENAI,
     BudgetLedger,
@@ -21,6 +22,7 @@ from intended_or_perceived.evaluation import (
     STUDY_CONDITIONS,
     Condition,
     PilotStopped,
+    ThirdModelUnavailable,
     make_model,
     mock_model_factory,
     run_evaluation,
@@ -430,3 +432,93 @@ def test_transcription_uses_free_text(pilot_inputs):
     assert len(result) == 48
     assert {row["completion"] for row in result} == {"Example mock transcription"}
     assert {row["status"] for row in result} == {"valid"}
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_third_model_uses_own_scope_and_output_limit(pilot_inputs, unavailable):
+    ledger = pilot_inputs["ledger"]
+    requests = []
+
+    async def generation(request):
+        requests.append(request)
+        assert request.url.path == "/v1beta/models/gemini-4-carbon:generateContent"
+        payload = json.loads(await request.aread())
+        assert payload["generationConfig"] == {"maxOutputTokens": 1024}
+        assert not payload.get("tools") and not payload.get("safetySettings")
+        if unavailable:
+            return httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "code": 404,
+                        "status": "NOT_FOUND",
+                        "message": "models/gemini-4-carbon is not found",
+                    }
+                },
+            )
+        prompt = payload["contents"][0]["parts"][1]["text"]
+        body = _gemini_payload(DISTRIBUTION if prompt == "P3-v2" else COMPLETION)
+        body["modelVersion"] = "gemini-4-carbon"
+        return httpx.Response(200, json=body)
+
+    def files(request):
+        info = {
+            "name": "files/mock-opaque",
+            "state": "ACTIVE",
+            "mimeType": "audio/mpeg",
+            "uri": f"https://{GOOGLE_HOST}/v1beta/files/mock-opaque",
+        }
+        if request.method == "GET":
+            return httpx.Response(200, json=info)
+        if not request.url.query:
+            return httpx.Response(
+                200,
+                headers={
+                    "x-goog-upload-url": f"https://{GOOGLE_HOST}/upload/v1beta/files?upload_id=mock-opaque",
+                },
+            )
+        return httpx.Response(
+            200, headers={"x-goog-upload-status": "final"}, json={"file": info}
+        )
+
+    def model_factory(model_id):
+        assert model_id == GEMINI_CARBON
+        return make_model(
+            model_id,
+            ledger,
+            profile=ReservationProfile(1, len(MEDIA), 5),
+            transport=httpx.MockTransport(generation),
+            files_transport=httpx.MockTransport(files),
+        )
+
+    kwargs = dict(
+        **pilot_inputs,
+        subset="pilot",
+        run_id="third-pilot-carbon",
+        model_ids=(GEMINI_CARBON,),
+        authorization="offline mock",
+        model_factory=model_factory,
+    )
+    if unavailable:
+        with pytest.raises(ThirdModelUnavailable, match="OptionalModelUnavailable"):
+            run_evaluation(**kwargs)
+        assert len(requests) == 1
+        assert ledger.records(run_id="third-pilot-carbon")[0]["http_status"] == 404
+        return
+
+    transcripts = run_evaluation(**kwargs)
+    assert (
+        len(transcripts)
+        == len(requests)
+        == len(ledger.records(run_id="third-pilot-carbon"))
+        == 120
+    )
+    assert {row["status"] for row in transcripts} == {"valid"}
+    assert {row["served_model"] for row in transcripts} == {"gemini-4-carbon"}
+    assert len([row for row in transcripts if row["prompt_file"] == "P3-v2.txt"]) == 24
+    checkpoint = json.loads(
+        (pilot_inputs["run_dir"] / "inputs.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["models"] == [GEMINI_CARBON]
+    assert checkpoint["max_output_tokens"] == {GEMINI_CARBON: 1024}
+    assert run_evaluation(**kwargs) == transcripts and len(requests) == 120

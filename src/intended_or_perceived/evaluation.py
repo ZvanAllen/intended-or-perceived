@@ -45,13 +45,16 @@ from intended_or_perceived.budget import (
     MAX_OUTPUT_TOKENS,
     OPENAI,
     OPENAI_HOST,
+    THIRD_GEMINI_MODELS,
     BudgetLedger,
     BudgetStop,
     BudgetTransport,
+    OptionalModelUnavailable,
     ProviderTransportError,
     RequestRejected,
     ReservationProfile,
     budget_scope,
+    model_output_limit,
     validate_google_files_request,
 )
 from intended_or_perceived.scoring import (
@@ -72,6 +75,10 @@ _RUN = ContextVar("pilot_run")
 
 class PilotStopped(RuntimeError):
     """The run needs to stop before more requests are dispatched."""
+
+
+class ThirdModelUnavailable(PilotStopped):
+    """The optional model itself was unavailable at the generation endpoint."""
 
 
 @dataclass(frozen=True)
@@ -272,6 +279,7 @@ class PilotRun:
         subset,
         authorization,
         legacy,
+        model_ids,
     ):
         self.directory = run_dir
         self.manifest_hash = manifest_hash
@@ -280,8 +288,10 @@ class PilotRun:
         self.ledger = ledger
         self.run_id = run_id
         self.subset = subset
+        self.model_ids = tuple(model_ids)
         self.conditions = tuple(prompts)
         self.halt_reason = None
+        self.model_unavailable = False
         self.failed_cells = 0
         self.secrets = tuple(
             value for name in KEY_NAMES if (value := os.environ.get(name))
@@ -295,9 +305,13 @@ class PilotRun:
                 prompt.family: prompt.sha256 for prompt in prompts.values()
             },
             "conditions": list(self.conditions),
-            "models": list(MODEL_IDS),
+            "models": list(self.model_ids),
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         }
+        if any(model in THIRD_GEMINI_MODELS for model in self.model_ids):
+            provenance["max_output_tokens"] = {
+                model: model_output_limit(model) for model in self.model_ids
+            }
         if not legacy:
             provenance.update(
                 run_id=run_id,
@@ -333,7 +347,7 @@ class PilotRun:
             row = json.loads(path.read_text(encoding="utf-8"))
             model, condition, sample_id = self.key(row)
             if (
-                model not in MODEL_IDS
+                model not in self.model_ids
                 or condition not in self.conditions
                 or sample_id not in clips
                 or path != self.row_path(model, condition, sample_id)
@@ -351,7 +365,13 @@ class PilotRun:
 
     def row_path(self, model, condition, sample_id):
         provider = model.split("/", 1)[0]
-        return self.rows_dir / f"{provider}_{condition}_{sample_id}.json"
+        provider_prefix = f"{provider}/"
+        prefix = (
+            model.replace("/", "_", 1)
+            if sum(item.startswith(provider_prefix) for item in self.model_ids) > 1
+            else provider
+        )
+        return self.rows_dir / f"{prefix}_{condition}_{sample_id}.json"
 
     def redact(self, value):
         if isinstance(value, str):
@@ -407,7 +427,7 @@ class PilotRun:
         for (model, condition, sample_id), attempts in attempts_by_cell.items():
             if (
                 (model, condition, sample_id) in self.rows
-                or model not in MODEL_IDS
+                or model not in self.model_ids
                 or condition not in self.conditions
                 or sample_id not in self.clips
             ):
@@ -436,7 +456,12 @@ class PilotRun:
 
     def failed(self, model, condition, sample_id, code):
         self.failed_cells += 1
-        if code in _SYSTEMIC_HTTP or code in {"BudgetStop", "RequestRejected"}:
+        self.model_unavailable = code == "OptionalModelUnavailable"
+        if (
+            code in _SYSTEMIC_HTTP
+            or self.model_unavailable
+            or code in {"BudgetStop", "RequestRejected"}
+        ):
             self.halt_reason = f"{model} {condition} {sample_id} stopped ({code})"
         elif self.failed_cells == 3:
             self.halt_reason = (
@@ -447,7 +472,7 @@ class PilotRun:
 def _error_code(error: BaseException):
     seen = set()
     while error is not None and id(error) not in seen:
-        if isinstance(error, (BudgetStop, RequestRejected)):
+        if isinstance(error, (BudgetStop, RequestRejected, OptionalModelUnavailable)):
             return type(error).__name__
         if isinstance(error, httpx.HTTPStatusError):
             return error.response.status_code
@@ -619,7 +644,7 @@ def _make_task(
         name=condition,
         dataset=dataset,
         config=GenerateConfig(
-            max_tokens=MAX_OUTPUT_TOKENS,
+            max_tokens=model_output_limit(model_id),
             max_retries=0,
             timeout=120,
             max_connections=1,
@@ -631,9 +656,9 @@ def _make_task(
 
 
 class _MeteredGemini(GoogleGenAIAPI):
-    def __init__(self, api_key, client, async_client):
+    def __init__(self, model_id, api_key, client, async_client):
         super().__init__(
-            model_name=GEMINI.split("/", 1)[1],
+            model_name=model_id.split("/", 1)[1],
             base_url=f"https://{GOOGLE_HOST}",
             api_key=api_key,
             api_version="v1beta",
@@ -699,7 +724,7 @@ async def make_model(
             api.qualified_model_name = model_id
             async with model:
                 yield model
-        elif model_id == GEMINI:
+        elif model_id == GEMINI or model_id in THIRD_GEMINI_MODELS:
             key = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"]
             with httpx.Client(
                 transport=files_transport,
@@ -713,7 +738,7 @@ async def make_model(
                     ]
                 },
             ) as files:
-                api = _MeteredGemini(key, files, client)
+                api = _MeteredGemini(model_id, key, files, client)
                 registry_tag(
                     lambda: None,
                     api,
@@ -753,7 +778,7 @@ _ACTIVE_CONDITION = ContextVar("active_condition")
 
 async def _run_conditions(run, model_factory):
     logs_dir = (run.directory / "inspect").as_posix()
-    for model_id in MODEL_IDS:
+    for model_id in run.model_ids:
         if all((model_id, c, s) in run.rows for c in run.conditions for s in run.clips):
             continue
         async with model_factory(model_id) as model:
@@ -771,7 +796,8 @@ async def _run_conditions(run, model_factory):
                     logs = await eval_async(
                         task,
                         model=model,
-                            score=run.subset != "main",
+                        score=run.subset != "main"
+                        and model_id not in THIRD_GEMINI_MODELS,
                         log_dir=logs_dir,
                         log_format="json",
                         log_images=False,
@@ -788,6 +814,8 @@ async def _run_conditions(run, model_factory):
                     _ACTIVE_CONDITION.reset(active_condition)
                 run.export()
                 if run.halt_reason:
+                    if run.model_unavailable:
+                        raise ThirdModelUnavailable(run.halt_reason)
                     raise PilotStopped(run.halt_reason)
                 if (
                     len(logs) != 1
@@ -845,12 +873,29 @@ def run_evaluation(
     stimuli: dict[str, PreparedStimulus] | None = None,
     reservation_profile: ReservationProfile | None = None,
     main_approved: bool = False,
+    model_ids: tuple[str, ...] = MODEL_IDS,
 ) -> list[dict]:
     """Run a frozen subset and condition set, or resume it from private checkpoints."""
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", run_id) or not authorization.strip():
         raise ValueError("A run ID and authorization provenance are required")
+    if (
+        not model_ids
+        or len(set(model_ids)) != len(model_ids)
+        or any(model not in (*MODEL_IDS, *THIRD_GEMINI_MODELS) for model in model_ids)
+    ):
+        raise ValueError("Select distinct supported evaluation models")
+    optional = any(model in THIRD_GEMINI_MODELS for model in model_ids)
+    if optional != run_id.startswith("third-") or (optional and len(model_ids) != 1):
+        raise ValueError("Run each optional model in a separate third-model scope")
+    if optional and (conditions != STUDY_CONDITIONS or stimuli is not None):
+        raise ValueError(
+            "The optional model requires the unchanged study conditions and media"
+        )
     if run_id == "pilot" and (
-        subset != "pilot" or conditions != LEGACY_CONDITIONS or stimuli
+        subset != "pilot"
+        or conditions != LEGACY_CONDITIONS
+        or stimuli
+        or model_ids != MODEL_IDS
     ):
         raise ValueError("The pilot run ID is reserved for the original Gate 1 inputs")
     if subset == "main" and ledger is not None and not main_approved:
@@ -885,6 +930,7 @@ def run_evaluation(
             subset=subset,
             authorization=authorization,
             legacy=run_id == "pilot",
+            model_ids=model_ids,
         )
         run.recover_interrupted_calls()
         token = _RUN.set(run)

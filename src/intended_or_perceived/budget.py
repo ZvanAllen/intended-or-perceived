@@ -11,7 +11,7 @@ import wave
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from time import monotonic
 
@@ -19,9 +19,15 @@ import httpx
 
 OPENAI = "openai/gpt-audio-1.5"
 GEMINI = "google/gemini-3.5-flash-lite"
+GEMINI_CARBON = "google/gemini-4-carbon"
+GEMINI_ARGON = "google/gemini-4-argon"
+GEMINI_HYDROGEN = "google/gemini-4-hydrogen"
+GEMINI_FLASH_38 = "google/gemini-3.8-flash"
+THIRD_GEMINI_MODELS = (GEMINI_CARBON, GEMINI_ARGON, GEMINI_HYDROGEN, GEMINI_FLASH_38)
 PROJECT_CAP_NANODOLLARS = 25_000_000_000
 DIAGNOSTIC_CAP_NANODOLLARS = 500_000_000
 MAX_OUTPUT_TOKENS = 256
+THIRD_MAX_OUTPUT_TOKENS = 1024
 OPENAI_HOST = "api.openai.com"
 GOOGLE_HOST = "generativelanguage.googleapis.com"
 
@@ -33,13 +39,32 @@ OPENAI_AUDIO_OUTPUT = 64_000
 GEMINI_INPUT = 300
 GEMINI_CACHED_INPUT = 30
 GEMINI_OUTPUT = 2_500
-INPUT_LIMIT = {OPENAI: 128_000, GEMINI: 1_048_576}
+INPUT_LIMIT = {
+    OPENAI: 128_000,
+    **dict.fromkeys((GEMINI, *THIRD_GEMINI_MODELS), 1_048_576),
+}
+
+# Documented paid Standard introductory rates and their last advertised day.
+# On that last UTC day, stop before dispatch so a request cannot overlap a
+# regional billing cutover. Reverify published rates before enabling later runs.
+_GEMINI_PRICE_EXPIRY = {
+    GEMINI_CARBON: date(2026, 11, 30),
+    GEMINI_ARGON: date(2026, 11, 30),
+    GEMINI_FLASH_38: date(2026, 12, 31),
+}
+_GEMINI_RATES = {
+    GEMINI: (GEMINI_INPUT, GEMINI_CACHED_INPUT, GEMINI_OUTPUT),
+    GEMINI_CARBON: (2_000, 100, 10_000),
+    GEMINI_ARGON: (2_000, 100, 10_000),
+    GEMINI_HYDROGEN: (1_500, 75, 7_500),
+    GEMINI_FLASH_38: (750, 75, 3_750),
+}
 
 _SCOPE = ContextVar("budget_scope", default=None)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 _GOOGLE_FILE = re.compile(r"/v1beta/files/[A-Za-z0-9._-]+")
-_GEMINI_PATH = "/v1beta/models/gemini-3.5-flash-lite:generateContent"
 _GOOGLE_FILE_MIME = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"}
+_STANDARD_GEMINI_TIERS = (None, "standard", "unspecified", "STANDARD", "UNSPECIFIED")
 _DURATION_PAD_SECONDS = 0.1
 # Twice Google's published 32 tokens per second and over eight times the observed
 # GPT-Audio pilot rate. Add framing allowances to the audio and text estimates.
@@ -65,6 +90,10 @@ class ProviderRequestError(RuntimeError):
         super().__init__(f"{model} rejected the request (HTTP {http_status})")
 
 
+class OptionalModelUnavailable(ProviderRequestError):
+    """The verified generation endpoint reported that this optional model is unavailable."""
+
+
 class ProviderTransportError(RuntimeError):
     """A network failure with an optional already-received HTTP status."""
 
@@ -74,6 +103,28 @@ class ProviderTransportError(RuntimeError):
             "before a response" if http_status is None else f"after HTTP {http_status}"
         )
         super().__init__(f"{model} transport failed {detail}")
+
+
+def model_output_limit(model: str) -> int:
+    if model not in INPUT_LIMIT:
+        raise ValueError("Model does not have verified pricing")
+    return (
+        THIRD_MAX_OUTPUT_TOKENS if model in THIRD_GEMINI_MODELS else MAX_OUTPUT_TOKENS
+    )
+
+
+def _gemini_rates(model: str, as_of: date | None = None) -> tuple[int, int, int]:
+    expiry = _GEMINI_PRICE_EXPIRY.get(model)
+    if expiry is not None and (as_of or datetime.now(UTC).date()) >= expiry:
+        raise BudgetStop(
+            "Optional model's introductory Gemini tariff needs re-verification"
+        )
+    return _GEMINI_RATES[model]
+
+
+def _require_model_scope(model: str, run_id: str) -> None:
+    if run_id.startswith("third-") != (model in THIRD_GEMINI_MODELS):
+        raise RequestRejected("Optional models may only be used in a third-model run")
 
 
 @dataclass(frozen=True)
@@ -145,7 +196,7 @@ class ReservationProfile:
     def max_reservation_nanodollars(self, model: str) -> int:
         return _reservation(
             model,
-            MAX_OUTPUT_TOKENS,
+            model_output_limit(model),
             *_input_bounds(self.max_duration_seconds, self.max_prompt_bytes),
         )
 
@@ -228,20 +279,26 @@ class BudgetLedger:
         return sqlite3.connect(self.path, timeout=30)
 
     @staticmethod
-    def _committed(connection, *, diagnostic: bool = False) -> int:
-        subset = (
-            " JOIN call_runs r ON r.call_id = calls.id WHERE r.run_id GLOB 'diagnostic-*'"
-            if diagnostic
-            else ""
-        )
+    def _committed(connection, *, run_pattern: str | None = None) -> int:
+        subset = ""
+        parameters = ()
+        if run_pattern is not None:
+            subset = " JOIN call_runs r ON r.call_id = calls.id WHERE r.run_id GLOB ?"
+            parameters = (run_pattern,)
         return connection.execute(
             "SELECT COALESCE(SUM(COALESCE(charged_nanodollars, reserved_nanodollars)), 0)"
-            " FROM calls" + subset
+            " FROM calls" + subset,
+            parameters,
         ).fetchone()[0]
 
-    def committed_nanodollars(self, *, diagnostic: bool = False) -> int:
+    def committed_nanodollars(
+        self, *, diagnostic: bool = False, third: bool = False
+    ) -> int:
+        if diagnostic and third:
+            raise ValueError("Select one run family or the complete ledger")
+        pattern = "third-*" if third else "diagnostic-*" if diagnostic else None
         with closing(self._connect()) as connection:
-            return self._committed(connection, diagnostic=diagnostic)
+            return self._committed(connection, run_pattern=pattern)
 
     def records(self, run_id: str | None = None) -> list[dict]:
         select = (
@@ -265,6 +322,7 @@ class BudgetLedger:
             raise RequestRejected("Request is outside an active experiment sample")
         if model not in INPUT_LIMIT or amount <= 0:
             raise RequestRejected("Invalid model budget reservation")
+        _require_model_scope(model, scope.run_id)
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             breach = connection.execute(
@@ -278,7 +336,7 @@ class BudgetLedger:
                 )
             if (
                 scope.run_id.startswith("diagnostic-")
-                and self._committed(connection, diagnostic=True) + amount
+                and self._committed(connection, run_pattern="diagnostic-*") + amount
                 > DIAGNOSTIC_CAP_NANODOLLARS
             ):
                 raise BudgetStop(
@@ -571,7 +629,7 @@ def _openai_usage(payload: dict) -> Usage | None:
     )
 
 
-def _gemini_usage(payload: dict) -> Usage | None:
+def _gemini_usage(payload: dict, rates: tuple[int, int, int]) -> Usage | None:
     usage = _object(payload.get("usageMetadata"))
     input_tokens = _token_count(usage.get("promptTokenCount"))
     total_tokens = _token_count(usage.get("totalTokenCount"))
@@ -599,8 +657,9 @@ def _gemini_usage(payload: dict) -> Usage | None:
     input_audio = (
         sum(audio_details) if audio_details and None not in audio_details else None
     )
-    charge = (input_tokens - cached) * GEMINI_INPUT + cached * GEMINI_CACHED_INPUT
-    charge += output_tokens * GEMINI_OUTPUT
+    input_rate, cached_rate, output_rate = rates
+    charge = (input_tokens - cached) * input_rate + cached * cached_rate
+    charge += output_tokens * output_rate
     return Usage(
         charge,
         "provider_usage",
@@ -652,25 +711,75 @@ def _output_limit(model: str, payload: dict) -> int:
             or payload.get("tools")
             or payload.get("cachedContent")
             or payload.get("systemInstruction")
-            or payload.get("serviceTier") not in (None, "STANDARD")
+            or payload.get("serviceTier") not in _STANDARD_GEMINI_TIERS
+            or generation.get("serviceTier") not in _STANDARD_GEMINI_TIERS
             or generation.get("thinkingConfig") not in (None, {"includeThoughts": True})
         ):
             raise RequestRejected(
                 "Gemini generation must use standard, single text output"
             )
-    if type(output) is not int or not 0 < output <= MAX_OUTPUT_TOKENS:
+        if model in THIRD_GEMINI_MODELS and (
+            payload.get("continuationToken") is not None
+            or generation.get("continuationToken") is not None
+            or generation.get("automaticContinuation") not in (None, False)
+        ):
+            raise RequestRejected("Optional model must use one generation hop")
+    if type(output) is not int or not 0 < output <= model_output_limit(model):
         raise RequestRejected("Generation request lacks a bounded output token limit")
     return output
 
 
-def _reservation(model: str, output: int, audio: int, text: int) -> int:
+def _reservation(
+    model: str,
+    output: int,
+    audio: int,
+    text: int,
+    *,
+    rates: tuple[int, int, int] | None = None,
+) -> int:
     if model == OPENAI:
         return (
             audio * OPENAI_AUDIO_INPUT
             + text * OPENAI_TEXT_INPUT
             + output * OPENAI_TEXT_OUTPUT
         )
-    return (audio + text) * GEMINI_INPUT + output * GEMINI_OUTPUT
+    input_rate, _, output_rate = rates or _gemini_rates(model)
+    return (audio + text) * input_rate + output * output_rate
+
+
+def _optional_model_unavailable(model: str, http_status: int, error: dict) -> bool:
+    if http_status == 404 and error.get("code") == "model_not_found":
+        return True
+    expected_status = {403: "PERMISSION_DENIED", 404: "NOT_FOUND"}.get(http_status)
+    if expected_status is None or error.get("status") != expected_status:
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    # GenerateContent uses the same status code for missing audio Files and
+    # denied projects. Only classify responses that identify the requested model.
+    model_name = model.split("/", 1)[1]
+    names_model = bool(
+        re.search(rf"(?<![\w-]){re.escape(model_name)}(?![\w-])", message)
+    )
+    reasons = (
+        "not found",
+        "not supported",
+        "not available",
+        "does not exist",
+        "access to",
+    )
+    return names_model and any(reason in message.lower() for reason in reasons)
+
+
+def _serves_requested_model(served, expected: str, *, optional: bool) -> bool:
+    if not isinstance(served, str):
+        return served is None and not optional
+    if optional:
+        # Prefer the stable ID. A numbered snapshot is still the same model;
+        # an alternate named variant or preview is not a verified tariff.
+        return bool(re.fullmatch(rf"{re.escape(expected)}(?:-\d+(?:-\d+)*)?", served))
+    return served == expected or served.startswith(expected + "-")
 
 
 class BudgetTransport(httpx.AsyncBaseTransport):
@@ -688,6 +797,7 @@ class BudgetTransport(httpx.AsyncBaseTransport):
             raise ValueError("Model does not have verified pricing")
         self._ledger = ledger
         self._model = model
+        self._service_model = model.split("/", 1)[1]
         self._profile = profile
         self._transport = (
             transport if transport is not None else httpx.AsyncHTTPTransport(retries=0)
@@ -697,6 +807,7 @@ class BudgetTransport(httpx.AsyncBaseTransport):
         scope = _SCOPE.get()
         if scope is None:
             raise RequestRejected("Request is outside an active experiment sample")
+        _require_model_scope(self._model, scope.run_id)
         if self._profile is None and scope.run_id != "pilot":
             raise RequestRejected("The run requires a verified request envelope")
         if self._model == OPENAI:
@@ -714,7 +825,8 @@ class BudgetTransport(httpx.AsyncBaseTransport):
             generation = (
                 _first_party(request, GOOGLE_HOST)
                 and request.method == "POST"
-                and request.url.path == _GEMINI_PATH
+                and request.url.path
+                == f"/v1beta/models/{self._service_model}:generateContent"
                 and not request.url.query
             )
             if not generation:
@@ -741,7 +853,10 @@ class BudgetTransport(httpx.AsyncBaseTransport):
             )
         else:
             audio_limit, text_limit = INPUT_LIMIT[self._model], 0
-        reservation = _reservation(self._model, output_limit, audio_limit, text_limit)
+        rates = _gemini_rates(self._model) if self._model != OPENAI else None
+        reservation = _reservation(
+            self._model, output_limit, audio_limit, text_limit, rates=rates
+        )
         call_id = self._ledger.reserve(self._model, reservation)
         start = monotonic()
         usage = None
@@ -762,16 +877,23 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                 ):
                     bound_exceeded = True
                     raise BudgetStop("OpenAI returned an unexpected price tier")
-                expected = self._model.split("/", 1)[1]
+                if self._model in THIRD_GEMINI_MODELS and any(
+                    tier not in _STANDARD_GEMINI_TIERS
+                    for tier in (
+                        payload.get("serviceTier"),
+                        _object(payload.get("usageMetadata")).get("serviceTier"),
+                    )
+                ):
+                    bound_exceeded = True
+                    raise BudgetStop(
+                        "Optional Gemini model returned an unexpected price tier"
+                    )
+                expected = self._service_model
                 served_model = payload.get(
                     "model" if self._model == OPENAI else "modelVersion"
                 )
-                if served_model is not None and not (
-                    isinstance(served_model, str)
-                    and (
-                        served_model == expected
-                        or served_model.startswith(expected + "-")
-                    )
+                if not _serves_requested_model(
+                    served_model, expected, optional=self._model in THIRD_GEMINI_MODELS
                 ):
                     bound_exceeded = True
                     raise BudgetStop(
@@ -780,7 +902,7 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                 usage = (
                     _openai_usage(payload)
                     if self._model == OPENAI
-                    else _gemini_usage(payload)
+                    else _gemini_usage(payload, rates)
                 )
                 if usage is None:
                     raise BudgetStop(
@@ -810,7 +932,7 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                         or usage.input_tokens - usage.input_audio_tokens > text_limit
                     )
             elif (
-                self._model == GEMINI
+                self._model in _GEMINI_RATES
                 and http_status in (400, 500)
                 and _object(payload.get("error")).get("code") == http_status
             ):
@@ -827,6 +949,10 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                     None,
                     None,
                 )
+            if self._model in THIRD_GEMINI_MODELS and _optional_model_unavailable(
+                self._model, http_status, _object(payload.get("error"))
+            ):
+                raise OptionalModelUnavailable(self._model, http_status)
             if not 200 <= http_status < 300:
                 raise ProviderRequestError(self._model, http_status)
             return response

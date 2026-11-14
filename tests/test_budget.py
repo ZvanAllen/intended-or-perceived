@@ -4,24 +4,32 @@ import io
 import sqlite3
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 
 import httpx
 import pytest
 
+from intended_or_perceived import budget
 from intended_or_perceived.budget import (
     DIAGNOSTIC_CAP_NANODOLLARS,
     GEMINI,
+    GEMINI_ARGON,
+    GEMINI_CARBON,
+    GEMINI_FLASH_38,
+    GEMINI_HYDROGEN,
     OPENAI,
     PROJECT_CAP_NANODOLLARS,
     BudgetLedger,
     BudgetStop,
     BudgetTransport,
+    OptionalModelUnavailable,
     ProviderRequestError,
     ProviderTransportError,
     RequestRejected,
     ReservationProfile,
     Usage,
     budget_scope,
+    model_output_limit,
     validate_google_files_request,
 )
 
@@ -468,6 +476,238 @@ def test_google_files_upload_is_bound_to_exact_scoped_media():
         )
         with pytest.raises(RequestRejected, match="verified stimulus"):
             validate_google_files_request(bad, profile=profile)
+
+
+def _optional_request(model):
+    url = GEMINI_URL.replace(GEMINI.split("/", 1)[1], model.split("/", 1)[1])
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "fileData": {
+                            "file_uri": "https://generativelanguage.googleapis.com/v1beta/files/sample",
+                            "mime_type": "audio/wav",
+                        }
+                    },
+                    {"text": "P1"},
+                ],
+            }
+        ],
+        "generationConfig": {"maxOutputTokens": 1024},
+    }
+    return url, body
+
+
+@pytest.fixture
+def optional_profile(monkeypatch):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 14, tzinfo=tz)
+
+    monkeypatch.setattr(budget, "datetime", FrozenDatetime)
+    media = _wav()
+    with budget_scope(
+        "P1",
+        "clip001",
+        run_id="third-experiment-pilot",
+        media_duration_seconds=1,
+        media_bytes=media,
+        prompt_bytes=b"P1",
+    ):
+        yield ReservationProfile(1, len(media), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,input_rate,cached_rate,output_rate",
+    [
+        (GEMINI_CARBON, 2_000, 100, 10_000),
+        (GEMINI_ARGON, 2_000, 100, 10_000),
+        (GEMINI_HYDROGEN, 1_500, 75, 7_500),
+        (GEMINI_FLASH_38, 750, 75, 3_750),
+    ],
+)
+async def test_optional_standard_tariff_at_model_specific_cap(
+    tmp_path,
+    optional_profile,
+    model,
+    input_rate,
+    cached_rate,
+    output_rate,
+):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    url, body = _optional_request(model)
+    response = {
+        **GEMINI_RESPONSE,
+        "modelVersion": model.split("/", 1)[1],
+        "usageMetadata": {
+            **GEMINI_RESPONSE["usageMetadata"],
+            "thoughtsTokenCount": 370,
+            "totalTokenCount": 500,
+            "serviceTier": "standard",
+        },
+    }
+    async with client_for(
+        ledger, model, lambda _: httpx.Response(200, json=response), optional_profile
+    ) as client:
+        await client.post(url, json=body)
+    (row,) = ledger.records()
+    assert model_output_limit(model) == 1024
+    assert model_output_limit(GEMINI) == model_output_limit(OPENAI) == 256
+    assert row["reserved_nanodollars"] == optional_profile.max_reservation_nanodollars(
+        model
+    )
+    assert row["reserved_nanodollars"] == 217 * input_rate + 1024 * output_rate
+    assert (
+        row["charged_nanodollars"]
+        == 95 * input_rate + 5 * cached_rate + 400 * output_rate
+    )
+    assert row["thinking_tokens"] == 370
+    assert row["run_id"] == "third-experiment-pilot"
+
+
+def test_optional_spend_includes_fallback_and_restart_in_project_cap(tmp_path):
+    path = tmp_path / "api-budget.db"
+    ledger = BudgetLedger(path)
+    with budget_scope("P1-R3", "clip259", run_id="pilot"):
+        ledger.reserve(OPENAI, 4_098_560_000)
+    with budget_scope("P1-R1", "clip001", run_id="third-carbon-pilot"):
+        first = ledger.reserve(GEMINI_CARBON, 8_000_000_000)
+        ledger.finish(first, None, 16, None)
+    reopened = BudgetLedger(path)
+    with budget_scope("P1-R1", "clip002", run_id="third-argon-pilot"):
+        second = reopened.reserve(GEMINI_ARGON, 2_000_000_000)
+        reopened.finish(
+            second,
+            Usage(1_000_000_000, "provider_usage", None, None, 1, 0, 0, 0, 0, 0),
+            5,
+            200,
+        )
+        reopened.reserve(GEMINI_ARGON, 1_100_000_000)
+    assert reopened.committed_nanodollars(third=True) == 10_100_000_000
+    assert reopened.committed_nanodollars() == 14_198_560_000
+    with budget_scope("P1-R1", "clip001", run_id="main"):
+        with pytest.raises(RequestRejected, match="third-model run"):
+            reopened.reserve(GEMINI_CARBON, 1)
+        with pytest.raises(BudgetStop, match="Project budget"):
+            reopened.reserve(OPENAI, 11_000_000_000)
+
+
+@pytest.mark.parametrize(
+    "model,before,cutoff",
+    [(GEMINI_CARBON, (11, 29), (11, 30)), (GEMINI_FLASH_38, (12, 30), (12, 31))],
+)
+def test_introductory_pricing_expires_before_cutover(model, before, cutoff):
+    assert budget._gemini_rates(model, date(2026, *before))[0] > 0
+    with pytest.raises(BudgetStop, match="tariff needs re-verification"):
+        budget._gemini_rates(model, date(2026, *cutoff))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", [{"serviceTier": "priority"}, {"continuationToken": "resume"}]
+)
+async def test_optional_url_and_tariff_inputs_cannot_reroute(
+    tmp_path, optional_profile, change
+):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    url, body = _optional_request(GEMINI_CARBON)
+    async with client_for(
+        ledger, GEMINI_CARBON, lambda _: pytest.fail("egress"), optional_profile
+    ) as client:
+        with pytest.raises(RequestRejected):
+            await client.post(GEMINI_URL, json=body)
+        with pytest.raises(RequestRejected):
+            await client.post(url, json={**body, **change})
+    assert ledger.records() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_response",
+    [
+        {"modelVersion": "gemini-4-argon"},
+        {"modelVersion": "gemini-4-carbon-preview"},
+        {"modelVersion": None},
+        {
+            "usageMetadata": {
+                **GEMINI_RESPONSE["usageMetadata"],
+                "serviceTier": "priority",
+            }
+        },
+    ],
+)
+async def test_optional_served_reroute_or_price_tier_locks_budget(
+    tmp_path, optional_profile, changed_response
+):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    url, body = _optional_request(GEMINI_CARBON)
+    received = {
+        **GEMINI_RESPONSE,
+        "modelVersion": "gemini-4-carbon",
+        **changed_response,
+    }
+    async with client_for(
+        ledger,
+        GEMINI_CARBON,
+        lambda _: httpx.Response(200, json=received),
+        optional_profile,
+    ) as client:
+        with pytest.raises(BudgetStop):
+            await client.post(url, json=body)
+    (row,) = ledger.records()
+    assert row["status"] == "limit_exceeded"
+    assert ledger.committed_nanodollars(third=True) == row["reserved_nanodollars"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,error,expected",
+    [
+        (
+            404,
+            {"status": "NOT_FOUND", "message": "models/gemini-4-carbon is not found"},
+            OptionalModelUnavailable,
+        ),
+        (
+            403,
+            {"status": "PERMISSION_DENIED", "message": "No access to gemini-4-carbon"},
+            OptionalModelUnavailable,
+        ),
+        (
+            404,
+            {"status": "NOT_FOUND", "message": "Upload not found"},
+            ProviderRequestError,
+        ),
+        (
+            403,
+            {"status": "PERMISSION_DENIED", "message": "Billing account disabled"},
+            ProviderRequestError,
+        ),
+    ],
+)
+async def test_optional_availability_distinguishes_explicit_model_error(
+    tmp_path, optional_profile, status, error, expected
+):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    url, body = _optional_request(GEMINI_CARBON)
+    async with client_for(
+        ledger,
+        GEMINI_CARBON,
+        lambda _: httpx.Response(status, json={"error": error}),
+        optional_profile,
+    ) as client:
+        with pytest.raises(expected) as raised:
+            await client.post(url, json=body)
+    assert type(raised.value) is expected
+    assert raised.value.http_status == status
+    assert error["message"] not in str(raised.value)
+    (row,) = ledger.records()
+    assert row["status"] == "ambiguous"
+    assert row["http_status"] == status
 
 
 @pytest.mark.asyncio
