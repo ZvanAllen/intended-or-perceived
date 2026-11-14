@@ -770,6 +770,7 @@ async def _run_conditions(run, model_factory):
                     logs = await eval_async(
                         task,
                         model=model,
+                            score=run.subset != "main",
                         log_dir=logs_dir,
                         log_format="json",
                         log_images=False,
