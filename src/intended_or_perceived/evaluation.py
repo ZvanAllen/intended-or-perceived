@@ -279,6 +279,7 @@ class PilotRun:
         self.prompts = prompts
         self.ledger = ledger
         self.run_id = run_id
+        self.subset = subset
         self.conditions = tuple(prompts)
         self.halt_reason = None
         self.failed_cells = 0
