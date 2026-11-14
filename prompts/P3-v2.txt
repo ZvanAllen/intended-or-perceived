@@ -1,0 +1,3 @@
+Imagine many listeners hear this clip once and each chooses exactly one emotion. They judge the speaker’s tone of voice and ignore the words spoken. What percentage of listeners would choose each emotion? Estimate a number from 0 to 100 for each label. Before responding, check that the six percentages add up to exactly 100 and adjust them if needed.
+
+Return a raw JSON object with exactly the six keys Anger, Disgust, Fear, Happy, Neutral, and Sad, each with a number as its value. Begin with { and end with }. Omit Markdown, code fences, and all other text.

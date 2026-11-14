@@ -1,0 +1,10 @@
+Choose the emotion that best describes how the speaker sounds. Base your answer on vocal cues such as pitch, loudness, pacing, and vocal quality. Ignore the sentence’s literal meaning and any emotion implied by the words.
+
+Anger — irritation, hostility, or forceful frustration.
+Disgust — revulsion or strong aversion.
+Fear — alarm, apprehension, or anxiety.
+Happy — joy, amusement, or positive excitement.
+Neutral — an even delivery with little expressive emotion.
+Sad — sorrow, dejection, or subdued unhappiness.
+
+Choose exactly one label. Give a confidence score from 0 to 100 for that choice. Return only a JSON object of the form {"label":"<emotion>","confidence":<number>}.

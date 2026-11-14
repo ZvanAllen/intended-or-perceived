@@ -1,0 +1,12 @@
+.env
+.env.*
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+/data/local/
+/results/private/
+/logs/
+/CODEX_HANDOVER.md
+/NOTES_FOR_ZACK.md

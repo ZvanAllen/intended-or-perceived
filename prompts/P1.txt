@@ -1,0 +1,2 @@
+Which emotion best describes the speaker’s tone of voice? Judge the sound of the voice and ignore the words spoken. Choose exactly one of Anger, Disgust, Fear, Happy, Neutral, or Sad. Give a confidence score from 0 to 100.
+Return only a JSON object of the form {"label":"<emotion>","confidence":<number>}.
