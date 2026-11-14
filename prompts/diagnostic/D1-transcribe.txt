@@ -1,0 +1,1 @@
+Transcribe the words actually spoken in this audio clip. Return only the spoken words as plain text. Do not describe the sound, the speaker, or the emotion.

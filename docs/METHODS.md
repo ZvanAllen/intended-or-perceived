@@ -23,6 +23,8 @@ $env:PYTHONPATH = 'src'
 
 The live pilot entry point is `python -m intended_or_perceived.pilot --live` from the locked environment. Supply `OPENAI_API_KEY` and either `GOOGLE_API_KEY` or `GEMINI_API_KEY` in the environment or in the ignored project `.env`. The runner records spend and unresolved reservations in `results/private/project_budget.sqlite3` and keeps transcripts and Inspect logs in `results/private/pilot/`. Keep those local paths intact to resume the pilot using the same ledger and checkpoints. Regenerate the coverage and cost report from those saved files with `python -m intended_or_perceived.pilot --report-only`.
 
+`python -m intended_or_perceived.audio_diagnostic` prepares the separate peak-adjusted pilot copies and records the original audio levels. `python -m intended_or_perceived.pre_main --report-only` rebuilds the diagnostic reports from the saved results. `python -m intended_or_perceived.pre_main --dry-run` exercises the main runner with local mock responses and writes to `results/private/main-dry-run/`. After explicit approval and a stimulus decision, the live main runner uses the `main` subset and run ID, the approved manifest and media, the project ledger, and `results/private/main/` for checkpoints and transcripts.
+
 ## Measurement
 
 Scoring validates the JSON output and records unscorable responses as unknown. The pilot report gives valid coverage, parse failures among received responses, request errors, metered cost and unresolved reservations. A complete pilot supports a projection using the observed mean by model, 1,500 fresh main-run calls per model and the cost of the pilot. The main-run analysis follows [ANALYSIS_PLAN.md](../ANALYSIS_PLAN.md).

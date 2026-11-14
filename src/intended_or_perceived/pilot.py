@@ -19,7 +19,7 @@ from intended_or_perceived.evaluation import (
     PilotStopped,
     run_pilot,
 )
-from intended_or_perceived.scoring import parse_output
+from intended_or_perceived.scoring import EMOTIONS, parse_output
 
 NANO_PER_DOLLAR = 1_000_000_000
 PILOT_CALLS_PER_MODEL = 120
@@ -88,6 +88,26 @@ def write_report(
             f"({outputs['valid'] / PILOT_CALLS_PER_MODEL:.1%}) | {rate} |"
         )
     lines += ["", "Parse-failure rates use received responses as the denominator."]
+    lines += [
+        "", "## Forced-choice predicted labels", "",
+        "| Model | Condition | Anger | Disgust | Fear | Happy | Neutral | Sad | Unknown |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    neutral_counts = []
+    for model in MODEL_IDS:
+        for condition in CONDITIONS[:-1]:
+            counts = Counter(
+                row.get("label") for row in rows
+                if row["model"] == model and row["condition"] == condition
+            )
+            neutral_counts.append(counts["Neutral"])
+            values = " | ".join(str(counts[label]) for label in (*EMOTIONS, None))
+            lines.append(f"| `{model}` | {condition} | {values} |")
+    if len(rows) == 2 * PILOT_CALLS_PER_MODEL:
+        lines += [
+            "",
+            f"Neutral accounted for {min(neutral_counts)} to {max(neutral_counts)} of 24 scheduled clips in every forced-choice run.",
+        ]
     outcomes = Counter(row["status"] for row in rows)
     if len(rows) != 2 * PILOT_CALLS_PER_MODEL or outcomes["request_error"]:
         lines += [

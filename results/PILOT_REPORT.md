@@ -24,6 +24,21 @@ failures, out-of-set labels, refusals, incomplete output and request errors.
 
 Parse-failure rates use received responses as the denominator.
 
+## Forced-choice predicted labels
+
+| Model | Condition | Anger | Disgust | Fear | Happy | Neutral | Sad | Unknown |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `openai/gpt-audio-1.5` | P1-R1 | 1 | 0 | 1 | 0 | 21 | 0 | 1 |
+| `openai/gpt-audio-1.5` | P1-R2 | 1 | 0 | 1 | 0 | 22 | 0 | 0 |
+| `openai/gpt-audio-1.5` | P1-R3 | 0 | 0 | 1 | 0 | 22 | 0 | 1 |
+| `openai/gpt-audio-1.5` | P2 | 1 | 0 | 2 | 0 | 21 | 0 | 0 |
+| `google/gemini-3.5-flash-lite` | P1-R1 | 0 | 0 | 0 | 1 | 23 | 0 | 0 |
+| `google/gemini-3.5-flash-lite` | P1-R2 | 0 | 0 | 0 | 0 | 24 | 0 | 0 |
+| `google/gemini-3.5-flash-lite` | P1-R3 | 0 | 0 | 0 | 0 | 23 | 1 | 0 |
+| `google/gemini-3.5-flash-lite` | P2 | 0 | 0 | 1 | 2 | 20 | 0 | 1 |
+
+Neutral accounted for 20 to 24 of 24 scheduled clips in every forced-choice run.
+
 Pilot outcomes recorded for 240/240 cells.
 
 ## Distribution prompt diagnosis

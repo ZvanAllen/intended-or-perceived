@@ -1,10 +1,15 @@
 import asyncio
+import base64
+import io
+import sqlite3
+import wave
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
 
 from intended_or_perceived.budget import (
+    DIAGNOSTIC_CAP_NANODOLLARS,
     GEMINI,
     OPENAI,
     PROJECT_CAP_NANODOLLARS,
@@ -12,7 +17,10 @@ from intended_or_perceived.budget import (
     BudgetStop,
     BudgetTransport,
     ProviderRequestError,
+    ProviderTransportError,
     RequestRejected,
+    ReservationProfile,
+    Usage,
     budget_scope,
     validate_google_files_request,
 )
@@ -50,9 +58,9 @@ GEMINI_RESPONSE = {
 }
 
 
-def client_for(ledger, provider, handler):
+def client_for(ledger, provider, handler, profile=None):
     transport = BudgetTransport(
-        ledger, provider, transport=httpx.MockTransport(handler)
+        ledger, provider, transport=httpx.MockTransport(handler), profile=profile
     )
     return httpx.AsyncClient(transport=transport, trust_env=False)
 
@@ -159,8 +167,9 @@ async def test_each_retry_dispatch_requires_reservation_and_timeout_holds_it(tmp
 
     async with client_for(ledger, OPENAI, handler) as client:
         with budget_scope("p1-1", "clip-001"):
-            with pytest.raises(httpx.ReadTimeout):
+            with pytest.raises(ProviderTransportError) as error:
                 await client.post(OPENAI_URL, json=OPENAI_REQUEST)
+            assert error.value.http_status is None
             with pytest.raises(BudgetStop, match="next request reservation"):
                 await client.post(OPENAI_URL, json=OPENAI_REQUEST)
     assert sent == 1
@@ -189,7 +198,9 @@ async def test_output_limit_breach_durably_blocks_further_calls(tmp_path):
 async def test_unverified_serving_tier_locks_ledger_and_preserves_hold(tmp_path):
     ledger = BudgetLedger(tmp_path / "api-budget.db")
     response = {**OPENAI_RESPONSE, "service_tier": "priority"}
-    async with client_for(ledger, OPENAI, lambda _: httpx.Response(200, json=response)) as client:
+    async with client_for(
+        ledger, OPENAI, lambda _: httpx.Response(200, json=response)
+    ) as client:
         with budget_scope("p1-1", "clip-001"):
             with pytest.raises(BudgetStop, match="unexpected price tier"):
                 await client.post(OPENAI_URL, json=OPENAI_REQUEST)
@@ -204,10 +215,14 @@ async def test_unverified_serving_tier_locks_ledger_and_preserves_hold(tmp_path)
 async def test_response_metadata_cannot_write_an_echoed_api_key(tmp_path):
     ledger = BudgetLedger(tmp_path / "api-budget.db")
     response = {**OPENAI_RESPONSE, "id": "chatcmpl-sk-test-secret"}
-    async with client_for(ledger, OPENAI, lambda _: httpx.Response(200, json=response)) as client:
+    async with client_for(
+        ledger, OPENAI, lambda _: httpx.Response(200, json=response)
+    ) as client:
         with budget_scope("p1-1", "clip-001"):
             await client.post(
-                OPENAI_URL, json=OPENAI_REQUEST, headers={"Authorization": "Bearer sk-test-secret"}
+                OPENAI_URL,
+                json=OPENAI_REQUEST,
+                headers={"Authorization": "Bearer sk-test-secret"},
             )
     assert ledger.records()[0]["response_id"] is None
     assert b"sk-test-secret" not in ledger.path.read_bytes()
@@ -229,16 +244,11 @@ async def test_documented_gemini_no_charge_and_sanitized_account_error(
 
     async with client_for(ledger, GEMINI, handler) as client:
         with budget_scope("p1-1", "clip-001"):
-            if http_status == 500:
-                assert (
-                    await client.post(GEMINI_URL, json=GEMINI_REQUEST)
-                ).status_code == 500
-            else:
-                with pytest.raises(
-                    ProviderRequestError, match=f"HTTP {http_status}"
-                ) as error:
-                    await client.post(GEMINI_URL, json=GEMINI_REQUEST)
-                assert "secret" not in str(error.value)
+            with pytest.raises(
+                ProviderRequestError, match=f"HTTP {http_status}"
+            ) as error:
+                await client.post(GEMINI_URL, json=GEMINI_REQUEST)
+            assert "secret" not in str(error.value)
     row = ledger.records()[0]
     assert row["charged_nanodollars"] == (None if billable else 0)
     assert row["status"] == ("ambiguous" if billable else "settled")
@@ -284,6 +294,180 @@ def test_google_files_allowlist_accepts_only_first_party_paths():
     ):
         with pytest.raises(RequestRejected):
             validate_google_files_request(httpx.Request("GET", url))
+
+
+def test_diagnostic_cap_survives_restarts_and_excludes_legacy_hold(tmp_path):
+    path = tmp_path / "api-budget.db"
+    ledger = BudgetLedger(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO calls (id, model, condition, sample_id, requested_at, status, "
+            "reserved_nanodollars) VALUES (69, ?, 'P1-R3', 'clip259', 'legacy', 'ambiguous', ?)",
+            (OPENAI, 4_098_560_000),
+        )
+    original = ledger.records()[0]
+    with budget_scope("D1", "clip001", run_id="diagnostic-d1"):
+        call1 = ledger.reserve(OPENAI, 300_000_000)
+        ledger.finish(call1, None, 16, None)
+    with budget_scope("P1", "clip001", run_id="diagnostic-gain"):
+        call2 = ledger.reserve(GEMINI, 200_000_000)
+        ledger.finish(
+            call2,
+            Usage(100_000_000, "provider_usage", None, None, 1, 0, 0, 0, 0, 0),
+            5,
+            200,
+        )
+    reopened = BudgetLedger(path)
+    with budget_scope("P3", "clip001", run_id="diagnostic-p3-v2"):
+        with pytest.raises(BudgetStop, match=r"US\$0.50 diagnostic"):
+            reopened.reserve(OPENAI, 100_000_001)
+        reopened.reserve(OPENAI, 100_000_000)
+    assert reopened.committed_nanodollars(diagnostic=True) == DIAGNOSTIC_CAP_NANODOLLARS
+    assert reopened.committed_nanodollars() == 4_598_560_000
+    assert reopened.records(run_id="pilot") == [original]
+
+
+def _wav(sample_count=8_000):
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setparams((1, 2, 8_000, sample_count, "NONE", "not compressed"))
+        audio.writeframes(b"\x00\x00" * sample_count)
+    return output.getvalue()
+
+
+def _openai_audio_payload(media, prompt="A clip", media_format="wav"):
+    return {
+        **OPENAI_REQUEST,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "format": media_format,
+                            "data": base64.b64encode(media).decode(),
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_sized_reservation_rejects_oversize_or_changed_body(tmp_path):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    media = _wav()
+    profile = ReservationProfile(5, len(media), 694)
+    mock = lambda _: httpx.Response(200, json=OPENAI_RESPONSE)
+    async with client_for(ledger, OPENAI, mock, profile) as client:
+        with budget_scope(
+            "P1",
+            "clip001",
+            run_id="diagnostic-gain",
+            media_duration_seconds=1,
+            media_bytes=media,
+            prompt_bytes=b"A clip",
+        ):
+            payload = _openai_audio_payload(media)
+            response = await client.post(OPENAI_URL, json=payload)
+            assert response.status_code == 200
+            with pytest.raises(RequestRejected, match="wire size"):
+                await client.post(
+                    OPENAI_URL, json={**payload, "unused": "x" * profile.max_wire_bytes}
+                )
+            with pytest.raises(RequestRejected, match="verified prompt"):
+                await client.post(
+                    OPENAI_URL, json=_openai_audio_payload(media, prompt="Changed")
+                )
+            with pytest.raises(RequestRejected, match="verified stimulus"):
+                await client.post(OPENAI_URL, json=_openai_audio_payload(media + b"x"))
+    (row,) = ledger.records()
+    # ceil((1 + .1) * 64) + 16 = 87 audio tokens, 6 + 128 text tokens.
+    assert row["reserved_nanodollars"] == 87 * 32_000 + 134 * 2_500 + 256 * 10_000
+    assert row["reserved_nanodollars"] < profile.max_reservation_nanodollars(OPENAI)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_requires_profile_and_reports_usage_envelope_breach(tmp_path):
+    ledger = BudgetLedger(tmp_path / "api-budget.db")
+    media = _wav()
+    response = {
+        **OPENAI_RESPONSE,
+        "usage": {
+            "prompt_tokens": 90,
+            "completion_tokens": 25,
+            "prompt_tokens_details": {"audio_tokens": 90},
+        },
+    }
+    with budget_scope(
+        "P1",
+        "clip001",
+        run_id="diagnostic-gain",
+        media_duration_seconds=1,
+        media_bytes=media,
+        prompt_bytes=b"A clip",
+    ):
+        async with client_for(
+            ledger, OPENAI, lambda _: pytest.fail("unexpected dispatch")
+        ) as client:
+            with pytest.raises(
+                RequestRejected, match="requires a verified request envelope"
+            ):
+                await client.post(OPENAI_URL, json=_openai_audio_payload(media))
+        async with client_for(
+            ledger,
+            OPENAI,
+            lambda _: httpx.Response(200, json=response),
+            ReservationProfile(1, len(media), len(b"A clip")),
+        ) as client:
+            with pytest.raises(BudgetStop, match="exceeded the request reservation"):
+                await client.post(OPENAI_URL, json=_openai_audio_payload(media))
+    assert ledger.records()[0]["status"] == "limit_exceeded"
+
+
+def test_google_files_upload_is_bound_to_exact_scoped_media():
+    url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+    media = _wav()
+    profile = ReservationProfile(1, len(media), len(b"P1"))
+    with budget_scope(
+        "P1",
+        "clip001",
+        run_id="diagnostic-gain",
+        media_duration_seconds=1,
+        media_bytes=media,
+        prompt_bytes=b"P1",
+    ):
+        initiate = httpx.Request(
+            "POST",
+            url,
+            headers={
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(len(media)),
+            },
+            json={},
+        )
+        validate_google_files_request(initiate, profile=profile)
+        finalize = httpx.Request(
+            "POST",
+            url + "?upload_id=mock",
+            headers={
+                "X-Goog-Upload-Command": "upload, finalize",
+                "X-Goog-Upload-Offset": "0",
+            },
+            content=media,
+        )
+        validate_google_files_request(finalize, profile=profile)
+        bad = httpx.Request(
+            "POST",
+            url + "?upload_id=mock",
+            headers=finalize.headers,
+            content=media + b"x",
+        )
+        with pytest.raises(RequestRejected, match="verified stimulus"):
+            validate_google_files_request(bad, profile=profile)
 
 
 @pytest.mark.asyncio

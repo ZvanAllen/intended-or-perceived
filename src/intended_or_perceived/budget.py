@@ -1,8 +1,13 @@
 """Reserve model spend before each HTTP generation and persist billable usage."""
 
+import base64
+import binascii
+import io
 import json
+import math
 import re
 import sqlite3
+import wave
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -15,6 +20,7 @@ import httpx
 OPENAI = "openai/gpt-audio-1.5"
 GEMINI = "google/gemini-3.5-flash-lite"
 PROJECT_CAP_NANODOLLARS = 25_000_000_000
+DIAGNOSTIC_CAP_NANODOLLARS = 500_000_000
 MAX_OUTPUT_TOKENS = 256
 OPENAI_HOST = "api.openai.com"
 GOOGLE_HOST = "generativelanguage.googleapis.com"
@@ -33,6 +39,14 @@ _SCOPE = ContextVar("budget_scope", default=None)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 _GOOGLE_FILE = re.compile(r"/v1beta/files/[A-Za-z0-9._-]+")
 _GEMINI_PATH = "/v1beta/models/gemini-3.5-flash-lite:generateContent"
+_GOOGLE_FILE_MIME = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"}
+_DURATION_PAD_SECONDS = 0.1
+# Twice Google's published 32 tokens per second and over eight times the observed
+# GPT-Audio pilot rate. Add framing allowances to the audio and text estimates.
+_AUDIO_TOKENS_PER_SECOND = 64
+_AUDIO_FRAMING_TOKENS = 16
+_TEXT_FRAMING_TOKENS = 128
+_WIRE_OVERHEAD_BYTES = 4096
 
 
 class BudgetStop(RuntimeError):
@@ -51,16 +65,97 @@ class ProviderRequestError(RuntimeError):
         super().__init__(f"{model} rejected the request (HTTP {http_status})")
 
 
+class ProviderTransportError(RuntimeError):
+    """A network failure with an optional already-received HTTP status."""
+
+    def __init__(self, model: str, http_status: int | None):
+        self.http_status = http_status
+        detail = (
+            "before a response" if http_status is None else f"after HTTP {http_status}"
+        )
+        super().__init__(f"{model} transport failed {detail}")
+
+
+@dataclass(frozen=True)
+class _Scope:
+    condition: str
+    sample_id: str
+    run_id: str
+    media_duration_seconds: float | None
+    media_bytes: bytes | None
+    prompt_bytes: bytes | None
+
+
 @contextmanager
-def budget_scope(condition: str, sample_id: str):
+def budget_scope(
+    condition: str,
+    sample_id: str,
+    *,
+    run_id: str = "pilot",
+    media_duration_seconds: float | None = None,
+    media_bytes: bytes | None = None,
+    prompt_bytes: bytes | None = None,
+):
     """Attach only opaque experiment identifiers to the request ledger."""
-    if not _IDENTIFIER.fullmatch(condition) or not _IDENTIFIER.fullmatch(sample_id):
+    if any(
+        not _IDENTIFIER.fullmatch(value) for value in (condition, sample_id, run_id)
+    ):
         raise RequestRejected("Invalid experiment request identifiers")
-    token = _SCOPE.set((condition, sample_id))
+    token = _SCOPE.set(
+        _Scope(
+            condition,
+            sample_id,
+            run_id,
+            media_duration_seconds,
+            media_bytes,
+            prompt_bytes,
+        )
+    )
     try:
         yield
     finally:
         _SCOPE.reset(token)
+
+
+@dataclass(frozen=True)
+class ReservationProfile:
+    """Largest verified stimulus and prompt in the run's frozen request envelope."""
+
+    max_duration_seconds: float
+    max_media_bytes: int
+    max_prompt_bytes: int
+
+    def __post_init__(self):
+        if (
+            not math.isfinite(self.max_duration_seconds)
+            or self.max_duration_seconds <= 0
+            or min(self.max_media_bytes, self.max_prompt_bytes) <= 0
+        ):
+            raise ValueError("Reservation dimensions must be positive and finite")
+
+    @property
+    def max_wire_bytes(self) -> int:
+        # Base64 expansion plus worst-case JSON ASCII escape overhead for prompt text.
+        return (
+            4 * math.ceil(self.max_media_bytes / 3)
+            + 6 * self.max_prompt_bytes
+            + _WIRE_OVERHEAD_BYTES
+        )
+
+    def max_reservation_nanodollars(self, model: str) -> int:
+        return _reservation(
+            model,
+            MAX_OUTPUT_TOKENS,
+            *_input_bounds(self.max_duration_seconds, self.max_prompt_bytes),
+        )
+
+
+def _input_bounds(duration: float, prompt_length: int) -> tuple[int, int]:
+    return (
+        math.ceil((duration + _DURATION_PAD_SECONDS) * _AUDIO_TOKENS_PER_SECOND)
+        + _AUDIO_FRAMING_TOKENS,
+        prompt_length + _TEXT_FRAMING_TOKENS,
+    )
 
 
 @dataclass(frozen=True)
@@ -112,6 +207,10 @@ class BudgetLedger:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     cap_nanodollars INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS call_runs (
+                    call_id INTEGER PRIMARY KEY REFERENCES calls(id),
+                    run_id TEXT NOT NULL
+                );
                 """
             )
             connection.execute(
@@ -129,22 +228,35 @@ class BudgetLedger:
         return sqlite3.connect(self.path, timeout=30)
 
     @staticmethod
-    def _committed(connection) -> int:
+    def _committed(connection, *, diagnostic: bool = False) -> int:
+        subset = (
+            " JOIN call_runs r ON r.call_id = calls.id WHERE r.run_id GLOB 'diagnostic-*'"
+            if diagnostic
+            else ""
+        )
         return connection.execute(
             "SELECT COALESCE(SUM(COALESCE(charged_nanodollars, reserved_nanodollars)), 0)"
-            " FROM calls"
+            " FROM calls" + subset
         ).fetchone()[0]
 
-    def committed_nanodollars(self) -> int:
+    def committed_nanodollars(self, *, diagnostic: bool = False) -> int:
         with closing(self._connect()) as connection:
-            return self._committed(connection)
+            return self._committed(connection, diagnostic=diagnostic)
 
-    def records(self) -> list[dict]:
+    def records(self, run_id: str | None = None) -> list[dict]:
+        select = (
+            "SELECT calls.*, COALESCE(r.run_id, 'pilot') AS run_id FROM calls"
+            " LEFT JOIN call_runs r ON r.call_id = calls.id"
+        )
+        parameters = ()
+        if run_id is not None:
+            select += " WHERE COALESCE(r.run_id, 'pilot') = ?"
+            parameters = (run_id,)
         with closing(self._connect()) as connection:
             connection.row_factory = sqlite3.Row
             return [
                 dict(row)
-                for row in connection.execute("SELECT * FROM calls ORDER BY id")
+                for row in connection.execute(select + " ORDER BY calls.id", parameters)
             ]
 
     def reserve(self, model: str, amount: int) -> int:
@@ -164,10 +276,28 @@ class BudgetLedger:
                 raise BudgetStop(
                     "Project budget cannot cover the next request reservation"
                 )
+            if (
+                scope.run_id.startswith("diagnostic-")
+                and self._committed(connection, diagnostic=True) + amount
+                > DIAGNOSTIC_CAP_NANODOLLARS
+            ):
+                raise BudgetStop(
+                    "US$0.50 diagnostic budget cannot cover the next request"
+                )
             row = connection.execute(
                 "INSERT INTO calls (model, condition, sample_id, requested_at, status, "
                 "reserved_nanodollars) VALUES (?, ?, ?, ?, 'reserved', ?)",
-                (model, *scope, datetime.now(UTC).isoformat(), amount),
+                (
+                    model,
+                    scope.condition,
+                    scope.sample_id,
+                    datetime.now(UTC).isoformat(),
+                    amount,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO call_runs (call_id, run_id) VALUES (?, ?)",
+                (row.lastrowid, scope.run_id),
             )
             return row.lastrowid
 
@@ -236,17 +366,141 @@ def _first_party(request, host: str) -> bool:
     )
 
 
-def validate_google_files_request(request) -> None:
+def _check_scope(profile: ReservationProfile) -> _Scope:
+    scope = _SCOPE.get()
+    if (
+        scope is None
+        or not isinstance(scope.media_bytes, bytes)
+        or not isinstance(scope.prompt_bytes, bytes)
+        or scope.media_duration_seconds is None
+        or not math.isfinite(scope.media_duration_seconds)
+        or not 0 < scope.media_duration_seconds <= profile.max_duration_seconds
+        or not 0 < len(scope.media_bytes) <= profile.max_media_bytes
+        or not 0 < len(scope.prompt_bytes) <= profile.max_prompt_bytes
+    ):
+        raise RequestRejected(
+            "Stimulus or prompt exceeds the verified request envelope"
+        )
+    if scope.media_bytes.startswith(b"RIFF"):
+        try:
+            with wave.open(io.BytesIO(scope.media_bytes)) as audio:
+                duration = audio.getnframes() / audio.getframerate()
+                is_pcm = audio.getsampwidth() == 2 and audio.getnchannels() == 1
+        except (EOFError, wave.Error, ZeroDivisionError):
+            raise RequestRejected("WAV media has an invalid PCM header") from None
+        if (
+            not is_pcm
+            or abs(duration - scope.media_duration_seconds) > _DURATION_PAD_SECONDS
+        ):
+            raise RequestRejected("WAV media differs from the verified PCM envelope")
+    return scope
+
+
+def validate_google_files_request(
+    request, *, profile: ReservationProfile | None = None
+) -> None:
     """Allow only the free first-party Files API upload, poll and deletion paths."""
     if _first_party(request, GOOGLE_HOST):
         path = request.url.path
         if request.method == "POST" and path == "/upload/v1beta/files":
+            if profile is not None:
+                scope = _check_scope(profile)
+                _validate_google_upload(request, scope.media_bytes)
             return
         if request.method in ("GET", "DELETE") and _GOOGLE_FILE.fullmatch(path):
             return
     raise RequestRejected(
         "Request does not match an allowed Google Files API operation"
     )
+
+
+def _validate_google_upload(request, expected_media: bytes) -> None:
+    command = request.headers.get("x-goog-upload-command", "")
+    offset = request.headers.get("x-goog-upload-offset", "")
+    if command == "start":
+        if request.headers.get("x-goog-upload-header-content-length") == str(
+            len(expected_media)
+        ):
+            return
+    elif (
+        command in ("upload", "upload, finalize")
+        and offset.isascii()
+        and offset.isdecimal()
+    ):
+        start = int(offset)
+        media = request.content
+        end = start + len(media)
+        if (
+            media
+            and end <= len(expected_media)
+            and media == expected_media[start:end]
+            and (command == "upload" or end == len(expected_media))
+        ):
+            return
+    raise RequestRejected("Gemini Files upload differs from the verified stimulus")
+
+
+def _text_matches(part: dict, expected: bytes) -> bool:
+    text = part.get("text")
+    return (
+        isinstance(text, str)
+        and text.encode("utf-8", errors="surrogatepass") == expected
+    )
+
+
+def _validate_wire_input(model, payload, scope):
+    # Both pinned adapters emit one user message containing one audio part plus one prompt.
+    if model == OPENAI:
+        messages = payload.get("messages")
+        source_key, parts_key = "input_audio", "content"
+    else:
+        messages = payload.get("contents")
+        source_key, parts_key = "fileData", "parts"
+    if not isinstance(messages, list) or len(messages) != 1:
+        raise RequestRejected("Generation must carry one verified user message")
+    message = _object(messages[0])
+    parts = message.get(parts_key)
+    if message.get("role") != "user" or not isinstance(parts, list) or len(parts) != 2:
+        raise RequestRejected(
+            "Generation does not match the verified audio and prompt shape"
+        )
+    sources = [_object(part) for part in parts if source_key in _object(part)]
+    prompts = [_object(part) for part in parts if "text" in _object(part)]
+    if (
+        len(sources) != 1
+        or len(prompts) != 1
+        or not _text_matches(prompts[0], scope.prompt_bytes)
+    ):
+        raise RequestRejected("Generation input differs from the verified prompt")
+    source = _object(sources[0][source_key])
+    is_wav = scope.media_bytes.startswith(b"RIFF")
+    if model == OPENAI:
+        try:
+            media = base64.b64decode(source.get("data", ""), validate=True)
+        except (ValueError, TypeError, binascii.Error):
+            raise RequestRejected("OpenAI request audio is not valid base64") from None
+        expected_format = "wav" if is_wav else "mp3"
+        if (
+            set(source) == {"data", "format"}
+            and source["format"] == expected_format
+            and media == scope.media_bytes
+        ):
+            return
+    elif set(source) in ({"fileUri", "mimeType"}, {"file_uri", "mime_type"}):
+        uri = source.get("fileUri", source.get("file_uri"))
+        media_type = source.get("mimeType", source.get("mime_type"))
+        trusted_uri = isinstance(uri, str) and uri.startswith(
+            f"https://{GOOGLE_HOST}/v1beta/files/"
+        )
+        if (
+            trusted_uri
+            and _GOOGLE_FILE.fullmatch(uri.removeprefix(f"https://{GOOGLE_HOST}"))
+            and isinstance(media_type, str)
+            and media_type in _GOOGLE_FILE_MIME
+            and is_wav == (media_type in ("audio/wav", "audio/x-wav"))
+        ):
+            return
+    raise RequestRejected("Generation input differs from the verified stimulus")
 
 
 def _token_count(value) -> int | None:
@@ -263,11 +517,15 @@ def _identifier(value) -> str | None:
 
 def _sanitize_usage(usage: Usage, request) -> Usage:
     authorization = request.headers.get("authorization", "")
-    secrets = (authorization.removeprefix("Bearer "), request.headers.get("x-goog-api-key", ""))
+    secrets = (
+        authorization.removeprefix("Bearer "),
+        request.headers.get("x-goog-api-key", ""),
+    )
     values = {
         field: None
         for field in ("served_model", "response_id")
-        if (value := getattr(usage, field)) and any(secret and secret in value for secret in secrets)
+        if (value := getattr(usage, field))
+        and any(secret and secret in value for secret in secrets)
     }
     return replace(usage, **values) if values else usage
 
@@ -380,6 +638,7 @@ def _output_limit(model: str, payload: dict) -> int:
             or payload.get("web_search_options")
             or payload.get("moderation")
             or payload.get("prompt_cache_options")
+            or payload.get("prediction")
         ):
             raise RequestRejected(
                 "OpenAI generation must use standard, single text output"
@@ -392,6 +651,7 @@ def _output_limit(model: str, payload: dict) -> int:
             or generation.get("candidateCount") not in (None, 1)
             or payload.get("tools")
             or payload.get("cachedContent")
+            or payload.get("systemInstruction")
             or payload.get("serviceTier") not in (None, "STANDARD")
             or generation.get("thinkingConfig") not in (None, {"includeThoughts": True})
         ):
@@ -403,30 +663,42 @@ def _output_limit(model: str, payload: dict) -> int:
     return output
 
 
-def _reservation(model: str, output: int) -> int:
-    # Full provider input limit at the highest applicable rate. Release unused spend
-    # only after receiving billable usage, including output/thinking tokens.
+def _reservation(model: str, output: int, audio: int, text: int) -> int:
     if model == OPENAI:
-        return INPUT_LIMIT[model] * OPENAI_AUDIO_INPUT + output * OPENAI_TEXT_OUTPUT
-    input_rate, output_rate = GEMINI_INPUT, GEMINI_OUTPUT
-    return INPUT_LIMIT[model] * input_rate + output * output_rate
+        return (
+            audio * OPENAI_AUDIO_INPUT
+            + text * OPENAI_TEXT_INPUT
+            + output * OPENAI_TEXT_OUTPUT
+        )
+    return (audio + text) * GEMINI_INPUT + output * GEMINI_OUTPUT
 
 
 class BudgetTransport(httpx.AsyncBaseTransport):
     """Meter physical HTTP dispatch so SDK retries and continuations also reserve spend."""
 
-    def __init__(self, ledger: BudgetLedger, model: str, *, transport=None):
+    def __init__(
+        self,
+        ledger: BudgetLedger,
+        model: str,
+        *,
+        transport=None,
+        profile: ReservationProfile | None = None,
+    ):
         if model not in INPUT_LIMIT:
             raise ValueError("Model does not have verified pricing")
         self._ledger = ledger
         self._model = model
+        self._profile = profile
         self._transport = (
             transport if transport is not None else httpx.AsyncHTTPTransport(retries=0)
         )
 
     async def handle_async_request(self, request):
-        if _SCOPE.get() is None:
+        scope = _SCOPE.get()
+        if scope is None:
             raise RequestRejected("Request is outside an active experiment sample")
+        if self._profile is None and scope.run_id != "pilot":
+            raise RequestRejected("The run requires a verified request envelope")
         if self._model == OPENAI:
             generation = (
                 _first_party(request, OPENAI_HOST)
@@ -446,11 +718,14 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                 and not request.url.query
             )
             if not generation:
-                validate_google_files_request(request)
+                validate_google_files_request(request, profile=self._profile)
                 return await self._transport.handle_async_request(request)
 
+        raw = await request.aread()
+        if self._profile and len(raw) > self._profile.max_wire_bytes:
+            raise RequestRejected("Request body exceeds the verified wire size")
         try:
-            payload = json.loads(await request.aread())
+            payload = json.loads(raw)
         except (ValueError, UnicodeError):
             raise RequestRejected(
                 "Generation request does not contain valid JSON"
@@ -458,7 +733,15 @@ class BudgetTransport(httpx.AsyncBaseTransport):
         if not isinstance(payload, dict):
             raise RequestRejected("Generation request must have an object body")
         output_limit = _output_limit(self._model, payload)
-        reservation = _reservation(self._model, output_limit)
+        if self._profile is not None:
+            scope = _check_scope(self._profile)
+            _validate_wire_input(self._model, payload, scope)
+            audio_limit, text_limit = _input_bounds(
+                scope.media_duration_seconds, len(scope.prompt_bytes)
+            )
+        else:
+            audio_limit, text_limit = INPUT_LIMIT[self._model], 0
+        reservation = _reservation(self._model, output_limit, audio_limit, text_limit)
         call_id = self._ledger.reserve(self._model, reservation)
         start = monotonic()
         usage = None
@@ -480,13 +763,20 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                     bound_exceeded = True
                     raise BudgetStop("OpenAI returned an unexpected price tier")
                 expected = self._model.split("/", 1)[1]
-                served_model = payload.get("model" if self._model == OPENAI else "modelVersion")
+                served_model = payload.get(
+                    "model" if self._model == OPENAI else "modelVersion"
+                )
                 if served_model is not None and not (
                     isinstance(served_model, str)
-                    and (served_model == expected or served_model.startswith(expected + "-"))
+                    and (
+                        served_model == expected
+                        or served_model.startswith(expected + "-")
+                    )
                 ):
                     bound_exceeded = True
-                    raise BudgetStop("Provider returned a model outside the verified pricing family")
+                    raise BudgetStop(
+                        "Provider returned a model outside the verified pricing family"
+                    )
                 usage = (
                     _openai_usage(payload)
                     if self._model == OPENAI
@@ -497,11 +787,28 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                         "Provider response omitted usable billable token counts"
                     )
                 usage = _sanitize_usage(usage, request)
+                if (
+                    self._profile is not None
+                    and self._model == OPENAI
+                    and usage.input_audio_tokens is None
+                ):
+                    # The previous conservative all-audio price can exceed a sized
+                    # reservation even on an ordinary response. Without the split,
+                    # keep the hold and stop before further dispatch.
+                    usage = None
+                    raise BudgetStop(
+                        "OpenAI response omitted audio billing detail for the sized reservation"
+                    )
                 bound_exceeded = (
-                    usage.input_tokens > INPUT_LIMIT[self._model]
+                    usage.input_tokens > audio_limit + text_limit
                     or usage.output_tokens > output_limit
                     or bool(usage.output_audio_tokens)
                 )
+                if self._profile is not None and usage.input_audio_tokens is not None:
+                    bound_exceeded |= (
+                        usage.input_audio_tokens > audio_limit
+                        or usage.input_tokens - usage.input_audio_tokens > text_limit
+                    )
             elif (
                 self._model == GEMINI
                 and http_status in (400, 500)
@@ -520,9 +827,11 @@ class BudgetTransport(httpx.AsyncBaseTransport):
                     None,
                     None,
                 )
-            if http_status in (400, 401, 402, 403, 404, 422):
+            if not 200 <= http_status < 300:
                 raise ProviderRequestError(self._model, http_status)
             return response
+        except httpx.RequestError:
+            raise ProviderTransportError(self._model, http_status) from None
         finally:
             self._ledger.finish(
                 call_id,
