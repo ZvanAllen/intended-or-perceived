@@ -1,6 +1,7 @@
 """Launch or report the prespecified higher-tier Gemini arm."""
 
 import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -18,12 +19,13 @@ from intended_or_perceived.budget import (
 )
 from intended_or_perceived.evaluation import (
     CONDITIONS,
+    STUDY_CONDITIONS,
     PilotStopped,
     ThirdModelUnavailable,
     run_evaluation,
 )
 from intended_or_perceived.pilot import load_project_keys
-from intended_or_perceived.scoring import EMOTIONS
+from intended_or_perceived.scoring import EMOTIONS, parse_recorded_output
 
 NANO_PER_USD = 1_000_000_000
 VALID_PER_CONDITION = 23
@@ -58,11 +60,64 @@ def _labels(row: dict) -> str:
     return ":".join(label for label in EMOTIONS if distribution.get(label) == best)
 
 
+def _verify_pilot_inputs(pilot_dir: Path, manifest: Path, model: str) -> None:
+    inputs = json.loads((pilot_dir / "inputs.json").read_text(encoding="utf-8"))
+    with manifest.open(encoding="utf-8", newline="") as stream:
+        selected = {
+            row["sample_id"]: row["media_sha256"]
+            for row in csv.DictReader(stream)
+            if row["pilot"] == "1"
+        }
+    prompts = {
+        c.name: (c.family, c.prompt_file, FROZEN_PROMPTS[c.prompt_file])
+        for c in STUDY_CONDITIONS
+    }
+    actual_prompts = {
+        name: (row["family"], row["file"], row["sha256"])
+        for name, row in inputs["prompts"].items()
+    }
+    if (
+        inputs["manifest_sha256"] != ORIGINAL_MANIFEST
+        or inputs["run_id"] != _run_id(model, "pilot")
+        or inputs["subset"] != "pilot"
+        or inputs["models"] != [model]
+        or inputs["max_output_tokens"] != {model: model_output_limit(model)}
+        or actual_prompts != prompts
+        or {name: row["sha256"] for name, row in inputs["stimuli"].items()} != selected
+        or len(selected) != PILOT_PER_CONDITION
+    ):
+        raise ValueError("The stored pilot inputs differ from the frozen study")
+    keys = set()
+    for line in (
+        (pilot_dir / "transcripts.jsonl").read_text(encoding="utf-8").splitlines()
+    ):
+        row = json.loads(line)
+        condition, sample = row["condition"], row["sample_id"]
+        key = (condition, sample)
+        if (
+            key in keys
+            or condition not in prompts
+            or sample not in selected
+            or row["model"] != model
+            or row["run_id"] != inputs["run_id"]
+            or row["manifest_sha256"] != ORIGINAL_MANIFEST
+            or row["media_sha256"] != selected[sample]
+            or (row["prompt"], row["prompt_file"], row["prompt_sha256"])
+            != prompts[condition]
+        ):
+            raise ValueError(
+                "A stored pilot response differs from the frozen input grid"
+            )
+        keys.add(key)
+    if len(keys) != len(CONDITIONS) * PILOT_PER_CONDITION:
+        raise ValueError("The stored pilot response grid is incomplete")
+
+
 def pilot_report(
     pilot_dir: Path, ledger: BudgetLedger, model_id: str
 ) -> tuple[str, dict]:
     transcript = pilot_dir / "transcripts.jsonl"
-    rows = (
+    raw_rows = (
         [
             json.loads(line)
             for line in transcript.read_text(encoding="utf-8").splitlines()
@@ -70,6 +125,14 @@ def pilot_report(
         if transcript.is_file()
         else []
     )
+    rows = [
+        {
+            **row,
+            "strict_status": parse_recorded_output(row, unwrap_fence=False).status,
+            **parse_recorded_output(row).as_dict(),
+        }
+        for row in raw_rows
+    ]
     run_id = _run_id(model_id, "pilot")
     attempts = ledger.records(run_id=run_id)
     charged = sum(row["charged_nanodollars"] or 0 for row in attempts)
@@ -85,23 +148,32 @@ def pilot_report(
         + (", ".join(f"`{name}`" for name in served) or "unavailable")
         + ".",
         "",
-        "| Condition | Valid / planned | Unknown types | Mean metered cost per recorded cell | Mean thinking tokens | Max thinking tokens |",
-        "| --- | ---: | --- | ---: | ---: | ---: |",
+        "| Condition | Strict valid | Amended valid | Strict unknown types | Amended unknown types | Mean metered cost per recorded cell | Mean thinking tokens | Max thinking tokens |",
+        "| --- | ---: | ---: | --- | --- | ---: | ---: | ---: |",
     ]
     distributions = []
     coverage = {}
+    strict_coverage = {}
     projected = 0
     for condition in CONDITIONS:
         group = [row for row in rows if row["condition"] == condition]
         statuses = Counter(row["status"] for row in group)
+        strict = Counter(row["strict_status"] for row in group)
         coverage[condition] = statuses["valid"]
+        strict_coverage[condition] = strict["valid"]
         states = {
             name: count for name, count in sorted(statuses.items()) if name != "valid"
         }
         pending = PILOT_PER_CONDITION - len(group)
         unknowns = [f"{name} {count}" for name, count in states.items()]
+        strict_unknowns = [
+            f"{name} {count}"
+            for name, count in sorted(strict.items())
+            if name != "valid"
+        ]
         if pending:
             unknowns.append(f"missing {pending}")
+            strict_unknowns.append(f"missing {pending}")
         request_rows = [row for row in attempts if row["condition"] == condition]
         metered = sum(row["charged_nanodollars"] or 0 for row in request_rows)
         mean = _money(metered / len(group)) if group else "—"
@@ -113,7 +185,7 @@ def pilot_report(
         mean_thinking = f"{statistics.mean(thinking):.1f}" if thinking else "—"
         max_thinking = str(max(thinking)) if thinking else "—"
         lines.append(
-            f"| {condition} | {statuses['valid']}/24 | {', '.join(unknowns) or 'None'} | {mean} | {mean_thinking} | {max_thinking} |"
+            f"| {condition} | {strict['valid']}/24 | {statuses['valid']}/24 | {', '.join(strict_unknowns) or 'None'} | {', '.join(unknowns) or 'None'} | {mean} | {mean_thinking} | {max_thinking} |"
         )
         if len(group) == PILOT_PER_CONDITION:
             projected += (
@@ -134,12 +206,16 @@ def pilot_report(
     gates = {
         "complete": completed,
         "strict_coverage": completed
+        and all(count >= VALID_PER_CONDITION for count in strict_coverage.values()),
+        "amended_coverage": completed
         and all(count >= VALID_PER_CONDITION for count in coverage.values()),
         "projected_main_nano": projected if completed else None,
         "third_cap": completed and projected <= THIRD_NANO_CAP,
         "project_cap": completed and current + projected < PROJECT_NANO_CAP,
     }
     lines += [
+        "",
+        "Predicted labels below use the amended parser. The stored completions were re-scored offline.",
         "",
         "| Condition | Predicted label counts (P3 uses tied largest shares) |",
         "| --- | --- |",
@@ -155,7 +231,7 @@ def pilot_report(
     unmet = [
         name.replace("_", " ")
         for name, passed in gates.items()
-        if name != "projected_main_nano" and not passed
+        if name not in {"projected_main_nano", "strict_coverage"} and not passed
     ]
     if unmet:
         lines += ["", "Unmet operational gates: " + ", ".join(unmet) + "."]
@@ -187,7 +263,7 @@ def main() -> None:
 
     if args.phase == "report":
         report, gates = pilot_report(pilot_dir, ledger, args.model)
-        (root / "results/THIRD_MODEL_PILOT_REPORT.md").write_text(
+        (root / "results/THIRD_MODEL_PILOT_AMENDED.md").write_text(
             report, encoding="utf-8", newline="\n"
         )
         print(json.dumps(gates))
@@ -215,10 +291,11 @@ def main() -> None:
     if len(list((main_dir / "samples").glob("*.json"))) != 3000:
         parser.error("The two-model main run must finish before the third arm")
     if args.phase == "main":
+        _verify_pilot_inputs(pilot_dir, manifest, args.model)
         _, gates = pilot_report(pilot_dir, ledger, args.model)
         if not all(
             gates[name]
-            for name in ("complete", "strict_coverage", "third_cap", "project_cap")
+            for name in ("complete", "amended_coverage", "third_cap", "project_cap")
         ):
             parser.error("The third model did not meet its live main-run gates")
 

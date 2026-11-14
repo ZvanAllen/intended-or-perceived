@@ -61,7 +61,7 @@ from intended_or_perceived.scoring import (
     EMOTIONS,
     ParsedOutput,
     label_matches,
-    parse_output,
+    parse_recorded_output,
 )
 
 CONDITIONS = ("P1-R1", "P1-R2", "P1-R3", "P2", "P3")
@@ -495,16 +495,6 @@ def _retryable(code):
     )
 
 
-def _parse_completion(completion, family, stop_reason):
-    if family != "D1":
-        return parse_output(completion, family, stop_reason=stop_reason)
-    if stop_reason in {"content_filter", "safety", "model_refusal", "refusal"}:
-        return ParsedOutput("refusal")
-    if stop_reason in {"length", "max_tokens", "model_length"}:
-        return ParsedOutput("incomplete")
-    return ParsedOutput("valid" if completion.strip() else "parse_error")
-
-
 @solver
 def pilot_generation(model_id: str, condition: str):
     async def solve(state: TaskState, generate: Generate) -> TaskState:
@@ -584,9 +574,8 @@ def pilot_generation(model_id: str, condition: str):
             if output.usage is not None
             else None,
         )
-        row.update(
-            _parse_completion(row["completion"], row["prompt"], stop_reason).as_dict()
-        )
+        row["strict_status"] = parse_recorded_output(row, unwrap_fence=False).status
+        row.update(parse_recorded_output(row).as_dict())
         run.commit(row)
         return state
 

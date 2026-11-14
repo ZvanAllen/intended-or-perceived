@@ -42,18 +42,30 @@ def test_pilot_counts_strict_conditions_and_projected_holds(tmp_path):
         {
             "condition": condition,
             "status": "valid",
-            "label": "Fear" if condition != "P3" else None,
-            "distribution": {"Fear": 0.5, "Neutral": 0.5},
+            "prompt": condition.split("-")[0],
+            "completion": (
+                '{"label":"Fear","confidence":50}'
+                if condition != "P3"
+                else '{"Anger":0,"Disgust":0,"Fear":50,"Happy":0,"Neutral":50,"Sad":0}'
+            ),
         }
         for condition in CONDITIONS
         for _ in range(24)
     ]
-    outcomes[-1].update(status="incomplete")
+    outcomes[-1].update(status="incomplete", stop_reason="max_tokens")
+    for row in outcomes[:6]:
+        row.update(
+            status="parse_error", completion=f"```json\n{row['completion']}\n```"
+        )
     path = tmp_path / "transcripts.jsonl"
-    path.write_text("".join(json.dumps(row) + "\n" for row in outcomes), encoding="utf-8")
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in outcomes), encoding="utf-8"
+    )
 
     report, gates = pilot_report(tmp_path, Ledger(5_000_000, 1_000_000), GEMINI_CARBON)
-    assert gates["strict_coverage"] and gates["third_cap"] and gates["project_cap"]
+    assert not gates["strict_coverage"]
+    assert gates["amended_coverage"] and gates["third_cap"] and gates["project_cap"]
+    assert "| P1-R1 | 18/24 | 24/24 | parse_error 6 | None |" in report
     assert gates["projected_main_nano"] == 7_512_500_000
     assert "Fear:Neutral 23" in report
     assert "incomplete 1" in report
