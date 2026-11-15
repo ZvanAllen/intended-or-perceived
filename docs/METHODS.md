@@ -1,6 +1,6 @@
 # Methods
 
-**Draft for Gate 3 review.** This exploratory study compares model judgments of acted vocal emotion with two references from CREMA-D. The intended label is the emotion the actor was asked to portray. The perceived voice reference is the plurality of retained voice-only listener choices, with ties preserved. CREMA-D was pinned to revision `1658cd342dff90010aa843eaeebd53610a08b1dc`. [CREMA-D and provider source lock](../SOURCE_LOCK.md) · [Frozen analysis plan](../ANALYSIS_PLAN.md)
+This exploratory study compares model judgments of acted vocal emotion with two references from CREMA-D. The intended label is the emotion the actor was asked to portray. The perceived voice reference is the plurality of retained voice-only listener choices, with ties preserved. CREMA-D was pinned to revision `1658cd342dff90010aa843eaeebd53610a08b1dc`. [CREMA-D and provider source lock](../SOURCE_LOCK.md) · [Frozen analysis plan](../ANALYSIS_PLAN.md)
 
 ## Sample and stimuli
 
@@ -32,19 +32,23 @@ For RQ2, P1-R1 accuracy and coverage are tabulated by agreement stratum. Spearma
 
 The results describe 300 scripted, acted English recordings from one dataset with one sampling design and three model configurations. The ratings were reported in 2014. Listener agreement depends on the selected panels and reflects correspondence to their votes under these conditions. Real-world emotion recognition would require separate validation. The human leave-one-out comparison and the full-panel perceived reference have different constructions. The majority-class baselines reflect the sampled mix, and 276 clips have unspecified intended intensity. Carbon used default `medium` thinking and a 1,024-token cap while the two other models ran under 256-token caps and their own provider defaults. The study cannot isolate model strength from these settings. Strict format exclusions change the set of Carbon clips that contribute to the sensitivity analysis. The analysis is exploratory and has not been peer reviewed.
 
-## Reproduce the analysis
+## Verify a public checkout
 
-The project uses Python 3.11 with pinned dependencies. Run from the checkout with the verified metadata in `data/local/metadata/`, the original two-model transcript and checkpoint header in `results/private/main/`, and their Carbon counterparts in `results/private/main/third-model/`. The [data preparation instructions](../data/README.md) show how to retrieve the public data. The analysis regenerates the CSV tables and the exploratory format examples from those inputs. The following commands make no model calls.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and work from the repository root. Set `PYTHONPATH` to `src` with `export PYTHONPATH=src` in a POSIX shell or `$env:PYTHONPATH = 'src'` in PowerShell. The commands below install the pinned Python 3.11 environment, render the three figures as PNG and PDF from the released CSVs, and run the tests and lint. The figure and test commands require no API keys or model calls.
 
-```powershell
-uv sync --locked --group analysis
-$env:PYTHONPATH = 'src'
-.venv/Scripts/python.exe -m intended_or_perceived.analysis
-.venv/Scripts/python.exe -m intended_or_perceived.figures --tables results/analysis --output results/figures
-.venv/Scripts/python.exe -m pytest
-.venv/Scripts/ruff.exe check src tests
+```sh
+uv sync --locked --python 3.11 --group analysis
+uv run --no-sync python -m intended_or_perceived.figures --tables results/analysis --output reproduced-figures
+uv run --no-sync python -m pytest
+uv run --no-sync ruff check src tests
 ```
 
-The [derived data tables](../results/analysis/RESULTS.md#figures-and-derived-data) allow inspection of coverage, scores, votes and clip-level stability without the raw transcripts. See the [deviation log](DEVIATIONS.md) for exploratory format checks and operational choices.
+The released tables also cover coverage by condition, scores, aggregate listener votes, and clip-level stability. [Derived data index](../results/analysis/RESULTS.md#figures-and-derived-data)
 
-AI coding agents assisted implementation under Zack van Allen’s direction. Zack set the design and analysis decisions. Gate 3 review of the findings and release wording is pending.
+## Replay the archived analysis
+
+Reparsing the original completions and recomputing the analysis tables and format examples requires verified CREMA-D metadata under `data/local/metadata/` and the private `inputs.json` and `transcripts.jsonl` files in each of `results/private/main/` and `results/private/main/third-model/`. The transcript and checkpoint files are held in the study archive. [Public data preparation](../data/README.md) · [Analysis provenance](../results/analysis/provenance.json) · [Deviation log](DEVIATIONS.md)
+
+With those inputs in place and the same environment set up, run `uv run --no-sync python -m intended_or_perceived.analysis --output replayed-analysis`. This replay uses the saved responses offline.
+
+AI coding agents assisted implementation under Zack van Allen’s direction. Zack set the design and analysis decisions.

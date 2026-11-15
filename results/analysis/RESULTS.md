@@ -48,11 +48,15 @@ The denominator for both stability subsets is 300 scheduled clips per model. The
 
 ## Figures and derived data
 
+The figures contain information from CREMA-D by Cao et al. (2014). The frozen manifest and the CREMA-D–derived CSV tables in this directory are available under the Open Database License 1.0. The Database Contents License 1.0 applies to the original CREMA-D contents. [Pinned CREMA-D dataset](https://github.com/CheyneyComputerScience/CREMA-D/tree/1658cd342dff90010aa843eaeebd53610a08b1dc) · [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) · [DbCL 1.0](https://opendatacommons.org/licenses/dbcl/1-0/) · [Data provenance and license](../../data/README.md)
+
 1. [Reference accuracy](../figures/figure1_reference_accuracy.png) shows amended P1-R1 accuracy and the same-subset listener baselines with actor-clustered intervals. Constant-label baselines use the same valid clips. [PDF](../figures/figure1_reference_accuracy.pdf)
 2. [Accuracy by listener agreement](../figures/figure2_agreement_accuracy.png) shows both references in the three strata. Baseline markers are horizontally offset within each stratum for legibility. [PDF](../figures/figure2_agreement_accuracy.pdf)
 3. [Repeat stability](../figures/figure3_repeat_stability.png) compares clip-level flips and aggregate accuracy range by reference on complete P1 triples. [PDF](../figures/figure3_repeat_stability.pdf)
 
 [Sample counts](sample_counts.csv) cover intended emotion, intensity, agreement, actor and sentence. The [accuracy tables](accuracies.csv) also include breakdowns by emotion and intensity. The three derived clip-level files contain [predictions and scores](per_clip_predictions.csv), [listener baseline aggregates](per_clip_listeners.csv), and [repeat and prompt label changes](per_clip_stability.csv). Join them on `sample_id` to the [frozen manifest](../../data/manifest.csv). Blank cells mark undefined or inapplicable values.
+
+The exploratory P1-R1 table reports accuracy and baselines on clips whose voice plurality excludes Neutral, under both parser rules. [Non-Neutral voice plurality subset](exploratory_non_neutral_plurality.csv)
 
 The [exploratory format checks](FORMAT_CHECKS.md) give Carbon’s fenced and unfenced counts and two verbatim examples from the eight GPT-Audio-1.5 P3 prose responses. The [deviation log](../../docs/DEVIATIONS.md) records those additions. Main-run transcript and prompt hashes are in [analysis provenance](provenance.json).
 

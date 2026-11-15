@@ -337,6 +337,38 @@ def _primary(parser, model, responses, clips, human, tables):
     )
 
 
+def _non_neutral_plurality(parser, model, responses, clips):
+    """Compare both references in the exploratory subset defined by listener votes."""
+    eligible = [
+        sample
+        for sample, clip in clips.items()
+        if "Neutral" not in clip["voice_majority"].split(":")
+    ]
+    valid = [sample for sample in eligible if responses[sample]["label"] is not None]
+    actors = [clips[sample]["actor"] for sample in valid]
+    columns = {
+        reference: [responses[sample][f"{reference}_match"] for sample in valid]
+        for reference in REFERENCES
+    }
+    intervals = actor_bootstrap(actors, columns)
+    return [
+        {
+            "parser": parser,
+            "model": model,
+            "condition": "P1-R1",
+            "reference": reference,
+            "n_eligible": len(eligible),
+            "n_valid": len(valid),
+            "n_actors": len(set(actors)),
+            **intervals[reference],
+            **baseline_accuracies(
+                _reference(clips[sample], reference) for sample in valid
+            ),
+        }
+        for reference in REFERENCES
+    ]
+
+
 def _coverage_and_labels(parser, model, conditions, tables):
     for condition, responses in conditions.items():
         values = list(responses.values())
@@ -608,6 +640,7 @@ def analyze(root: Path, output: Path) -> None:
             "figure3",
             "sample_counts",
             "per_clip_listeners",
+            "exploratory_non_neutral_plurality",
         )
     }
     indexed = _responses(saved, clips, tables)
@@ -643,6 +676,9 @@ def analyze(root: Path, output: Path) -> None:
             }
             _descriptive_accuracy(parser, model, by_condition, clips, tables)
             _primary(parser, model, by_condition["P1-R1"], clips, human, tables)
+            tables["exploratory_non_neutral_plurality"].extend(
+                _non_neutral_plurality(parser, model, by_condition["P1-R1"], clips)
+            )
             _coverage_and_labels(parser, model, by_condition, tables)
             _stability(parser, model, by_condition, clips, tables)
     _format_checks(saved, indexed, tables, output)

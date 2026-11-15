@@ -11,6 +11,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 
 REFERENCES = ("intended", "perceived")
@@ -25,6 +26,12 @@ _SHAPES = ("o", "s", "^")
 _INK = "#19242e"
 _SECONDARY = "#465565"
 _GRID = "#d9e0e6"
+_DATASET_URL = "https://github.com/CheyneyComputerScience/CREMA-D"
+_LICENSE_URL = "https://opendatacommons.org/licenses/odbl/1-0/"
+_ATTRIBUTION = (
+    f"Contains information from CREMA-D ({_DATASET_URL}), made available "
+    f"under the Open Database License 1.0 ({_LICENSE_URL})."
+)
 _REFERENCE_TITLES = {
     "intended": "Intended emotion",
     "perceived": "Perceived voice emotion",
@@ -133,10 +140,40 @@ def _baseline_keys(rows):
     ]
 
 
+def _add_attribution(figure):
+    footer = (
+        ("CREMA-D data (Cao et al., 2014)  ·  ", None),
+        (_DATASET_URL.removeprefix("https://"), _DATASET_URL),
+        ("  ·  ODbL 1.0  ·  ", None),
+        (_LICENSE_URL.removeprefix("https://"), _LICENSE_URL),
+    )
+    parts = [
+        TextArea(
+            label,
+            textprops={
+                "fontsize": 8,
+                "color": _COLORS[0] if url else _SECONDARY,
+                "url": url,
+            },
+        )
+        for label, url in footer
+    ]
+    stripe = AnchoredOffsetbox(
+        loc="lower center",
+        child=HPacker(children=parts, align="baseline", pad=0, sep=0),
+        pad=0,
+        borderpad=0,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.023),
+        bbox_transform=figure.transFigure,
+    )
+    figure.add_artist(stripe)
+
+
 def _reference_accuracy(rows):
     models = _models(rows)
-    fig, axes = plt.subplots(1, 2, figsize=(8.3, 3.35), sharex=True, sharey=True)
-    fig.subplots_adjust(left=0.235, right=0.975, top=0.82, bottom=0.29, wspace=0.19)
+    fig, axes = plt.subplots(1, 2, figsize=(8.3, 3.65), sharex=True, sharey=True)
+    fig.subplots_adjust(left=0.235, right=0.975, top=0.835, bottom=0.35, wspace=0.19)
     baselines = _baseline_keys(rows)
     for axis, reference in zip(axes, REFERENCES, strict=True):
         axis.set_title(_REFERENCE_TITLES[reference], pad=10)
@@ -173,7 +210,7 @@ def _reference_accuracy(rows):
         _grid(axis, "x")
     axes[0].set_yticks(range(len(models)), [_name(model) for model in models])
     axes[0].set_ylim(len(models) - 0.52, -0.6)
-    fig.supxlabel("Accuracy or individual listener agreement", y=0.14, fontsize=9.5)
+    fig.supxlabel("Accuracy or individual listener agreement", y=0.21, fontsize=9.5)
     handles = [
         _mark(_COLORS[0], "o", "Model"),
         _mark(_SECONDARY, "D", "Individual listener", fill=False),
@@ -184,7 +221,7 @@ def _reference_accuracy(rows):
         loc="lower center",
         ncols=len(handles),
         frameon=False,
-        bbox_to_anchor=(0.56, 0.003),
+        bbox_to_anchor=(0.56, 0.085),
         fontsize=8.7,
     )
     return fig
@@ -193,9 +230,9 @@ def _reference_accuracy(rows):
 def _agreement_accuracy(rows):
     models = _models(rows)
     fig, axes = plt.subplots(
-        1, len(models), figsize=(8.3, 3.55), sharey=True, squeeze=False
+        1, len(models), figsize=(8.3, 3.85), sharey=True, squeeze=False
     )
-    fig.subplots_adjust(left=0.095, right=0.985, top=0.82, bottom=0.28, wspace=0.27)
+    fig.subplots_adjust(left=0.095, right=0.985, top=0.834, bottom=0.336, wspace=0.27)
     baselines = _baseline_keys(rows)
     for index, (axis, model) in enumerate(zip(axes[0], models, strict=True)):
         axis.set_title(_name(model), pad=10)
@@ -251,7 +288,7 @@ def _agreement_accuracy(rows):
             axis.spines["left"].set_visible(False)
         _grid(axis, "y")
     axes[0][0].set_ylabel("Accuracy")
-    fig.supxlabel("Voice agreement stratum", y=0.13, fontsize=9.5)
+    fig.supxlabel("Voice agreement stratum", y=0.198, fontsize=9.5)
     handles = [
         _mark(
             _COLORS[index],
@@ -266,7 +303,7 @@ def _agreement_accuracy(rows):
         loc="lower center",
         ncols=len(handles),
         frameon=False,
-        bbox_to_anchor=(0.535, 0.003),
+        bbox_to_anchor=(0.535, 0.081),
         fontsize=8.6,
     )
     return fig
@@ -274,8 +311,8 @@ def _agreement_accuracy(rows):
 
 def _repeat_stability(rows):
     models = _models(rows)
-    fig, axes = plt.subplots(1, 2, figsize=(8.3, 3.65), sharex=True, sharey=True)
-    fig.subplots_adjust(left=0.108, right=0.975, top=0.83, bottom=0.25, wspace=0.16)
+    fig, axes = plt.subplots(1, 2, figsize=(8.3, 3.95), sharex=True, sharey=True)
+    fig.subplots_adjust(left=0.108, right=0.975, top=0.843, bottom=0.307, wspace=0.16)
     x_max = max((_number(row, "flip_rate") or 0 for row in rows.values()), default=0)
     y_max = max(
         (_number(row, "accuracy_range") or 0 for row in rows.values()), default=0
@@ -307,7 +344,7 @@ def _repeat_stability(rows):
         _grid(axis, "both")
     axes[0].set_ylabel("Range of repeat accuracy\n(percentage points)")
     axes[1].spines["left"].set_visible(False)
-    fig.supxlabel("Clips with a label change across repeats", y=0.113, fontsize=9.5)
+    fig.supxlabel("Clips with a label change across repeats", y=0.18, fontsize=9.5)
     handles = []
     for index, model in enumerate(models):
         counts = {
@@ -332,7 +369,7 @@ def _repeat_stability(rows):
         loc="lower center",
         ncols=len(handles),
         frameon=False,
-        bbox_to_anchor=(0.56, 0.003),
+        bbox_to_anchor=(0.56, 0.079),
         fontsize=8.6,
     )
     return fig
@@ -355,8 +392,16 @@ def render(tables: Path, output: Path):
             rows = _index(tables / f"figure{index}.csv", fields)
             figure = plot(rows)
             try:
-                figure.savefig(output / f"{name}.png", dpi=300)
-                figure.savefig(output / f"{name}.pdf", metadata={"CreationDate": None})
+                _add_attribution(figure)
+                figure.savefig(
+                    output / f"{name}.png",
+                    dpi=300,
+                    metadata={"Description": _ATTRIBUTION},
+                )
+                figure.savefig(
+                    output / f"{name}.pdf",
+                    metadata={"CreationDate": None, "Subject": _ATTRIBUTION},
+                )
             finally:
                 plt.close(figure)
 
